@@ -1,4 +1,4 @@
-**`otrace.hpp`**
+## `otrace.hpp`
 is a single header that lets you annotate your C++ code with timeline events and then inspect them in Perfetto UI or chrome://tracing. You sprinkle a few macros around the code you care about, scopes, instants, counters, flows, frames, and the program produces a compact `trace.json`. Open that file in a timeline viewer and you can finally _see_ what your application did, when it did it, and on which threads, with microsecond resolution and essentially no setup beyond including one header.
 
 This isn’t a sampling profiler or a system-wide tracer. It is deliberate, in-process instrumentation you control. Nothing is captured unless you emit it, which means the timeline shows the exact narrative you intended: your critical sections, your I/O, your queues, your handoffs, the shape of a frame, the path of a task.
