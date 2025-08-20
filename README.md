@@ -50,7 +50,7 @@ otrace requires **C++17+** and works on Windows/Linux/macOS so you can build it 
 - MSVC:
     
     `cl /std:c++17 /O2 /EHsc /DOTRACE=1 main.cpp`
-Run the program; you’ll find a `trace.json` in the current directory (or whatever path you set). Drag and drop that file into **Perfetto UI** at https://ui.perfetto.dev or open **chrome://tracing** in Chrome and use the “Load” button. You’ll see your process and threads on the left, and on the right a time axis with colored slices for scopes, vertical pins for instants, graphs for counters, and optional arrows for flows.
+Run the program; you’ll find a `trace.json` in the current directory (or whatever path you set). Drag and drop that file into **Perfetto UI** at https://ui.perfetto.dev or open chrome://tracing in Chrome and use the “Load” button. You’ll see your process and threads on the left, and on the right a time axis with colored slices for scopes, vertical pins for instants, graphs for counters, and optional arrows for flows.
 
 ## What you can emit (and how it appears)
 
