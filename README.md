@@ -27,7 +27,7 @@ This isn’t a sampling profiler or a system-wide tracer. It is deliberate, in-p
 
 ## Getting started
 
-Add the header to your project. Build your program with C++17 or later and define `OTRACE=1` to enable instrumentation. When `OTRACE` is left at the default `0`, every macro compiles out to a no-op, so there’s no overhead in production by default. Add -pthread on Linux/macOS if you use threads.
+Add the header to your project. Build your program with C++17 or later and define `OTRACE=1` to enable instrumentation. When `OTRACE` is left at the default `0`, every macro compiles out to a no-op, so there’s no overhead in production by default. Add `-pthread` on Linux when using threads (it’s accepted and harmless on macOS/Clang).
 ```cpp
 // main.cpp
 #define OTRACE 1
@@ -44,7 +44,7 @@ void work_unit(int i) {
 }
 
 int main() {
-  TRACE_SET_PROCESS_NAME("sample-app");
+  TRACE_SET_PROCESS_NAME("otrace-demo");
   TRACE_SET_OUTPUT_PATH("trace.json");       // optional; defaults to "trace.json"
 
   {
@@ -139,10 +139,12 @@ TRACE_SET_PROCESS_NAME("imgproc");
 TRACE_SET_THREAD_NAME("worker-0");
 TRACE_SET_THREAD_SORT_INDEX(10);              // bigger numbers go lower in the stack
 ```
-If you want one specific event to pop, you can hint a **color** for the next emission:
+**Color hints (`cname`)**  
+If you want a specific event to stand out, hint a color for the **next** emission. Perfetto understands several canonical names (e.g. `"good"`, `"bad"`, `"terrible"`) and maps them to consistent palette colors.
+
 ```cpp
-TRACE_COLOR("good");                          // the next event will carry cname:"good"
-TRACE_SCOPE("hot_path");                      // that one event gets the color hint
+TRACE_COLOR("good");          // the *next* event will carry cname:"good"
+TRACE_SCOPE("hot_path");      // only this event gets the hint
 ```
 ## How timestamps work (and what to choose)
 
@@ -154,7 +156,7 @@ Every timestamp in `trace.json` is **microseconds since first use** within your 
     
 - A third option uses `std::chrono::system_clock` (compile with `-DOTRACE_CLOCK=3`). This gives you wall-clock deltas and is susceptible to NTP or manual adjustments; it is rarely needed unless you want to align a trace with external logs by wall time.
 
-- RDTSC assumes an invariant, synchronized TSC. On some laptops, VMs, and turbo/parking scenarios, calibration can be noisy; if in doubt, use the default steady_clock.If you see discontinuities or negative deltas on laptops/VMs, switch back to steady_clock (OTRACE_CLOCK=1).
+- RDTSC assumes an invariant, synchronized TSC. On some laptops, VMs, and turbo/parking scenarios, calibration can be noisy; if in doubt, use the default steady_clock. If you see discontinuities or negative deltas on laptops/VMs, switch back to steady_clock (OTRACE_CLOCK=1).
 
 If you compile with `OTRACE_CLOCK=2` on a non-x86 target, the header silently falls back to `steady_clock`.
 ## Buffering, flushing, and the file on disk
@@ -199,6 +201,8 @@ This view shows the big picture: per-thread rows, named slices from `TRACE_SCOPE
   <img src="docs/images/overview-timeline.png" alt="Overview of threads and scoped events in Perfetto" title="Overview timeline">
 </p>
 
+The producer emits `make_job` while the consumer runs `process`; overlap shows pipeline fill, gaps show stalls.
+
 **Minimal Repro:**
 ```cpp
 TRACE_SET_PROCESS_NAME("otrace-showcase");
@@ -232,6 +236,7 @@ TRACE_COUNTER("queue_len", static_cast<int>(queue.size()));
 The orange arrows below connect a `make_job` slice on the producer to the corresponding `process` slice on the consumer. Use `TRACE_FLOW_BEGIN(id)` at the source, `TRACE_FLOW_STEP(id)` for hops, and `TRACE_FLOW_END(id)` at the sink. Pick a stable `id` (e.g., your job id).
 
 <p align="center"> <img src="docs/images/flows.png" alt="Flow arrows connecting producer and consumer slices" title="Flows across threads"> </p>
+Arrows link a job’s creation on producer to its handling on consumer; breaks in arrows indicate queueing latency.
 
 **Minimal Repro**:
 ```cpp
@@ -365,7 +370,7 @@ Advanced (rarely needed, but available if you need to trim strings):
     
 
 You set these with your usual build flags, e.g.:
-```
+```sh
 c++ -std=c++17 -O2 -DOTRACE=1 -DOTRACE_CLOCK=2 -DOTRACE_THREAD_BUFFER_EVENTS=8192 main.cpp
 
 ```
@@ -508,6 +513,19 @@ Microseconds since first use (`ts`/`dur`). That’s what Perfetto and Chrome’s
 
 **Why does `chrome://tracing` reject a file that opens in Perfetto?**  
 Perfetto UI is the reference viewer for Chrome Trace Event JSON and is actively maintained. If Chrome rejects a trace that works in Perfetto, prefer Perfetto.
+
+## Privacy & Security
+
+`otrace.hpp` is strictly **in-process** and writes a local `trace.json`. It does not sample the OS, inject into other processes, open network sockets, or require elevated permissions. That said, traces can still leak information if you put sensitive data into event names/args.
+
+- **Only emit what you’re comfortable sharing.** Don’t put secrets (API keys, tokens, DB URIs, customer PII) in `TRACE_*` names or string args. Prefer IDs or coarse labels.
+- **Prefer IDs/hashes over raw values.** If you need to correlate, emit a stable numeric ID (or a short hash) and keep the mapping elsewhere.
+- **Mind file paths & perms.** `TRACE_SET_OUTPUT_PATH()` writes wherever you point it. Keep traces out of shared/temp directories and out of public repos by default.
+- **Redaction for sharing.** Before posting a trace publicly, scrub or regenerate it with sanitized names/args. The JSON is simple enough to post-process.
+- **Runtime control.** Leave `OTRACE=0` in default production builds, or gate tracing behind a config/env flag so you don’t emit timelines by accident.
+
+Implementation notes: JSON output is escaped; event writes are lock-free and local to each thread; there’s no async-signal safety guarantee; `RDTSC` mode reads TSC on x86 but does not touch privileged registers or timers.
+
 
 ## License
 
