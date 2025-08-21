@@ -3,7 +3,24 @@
 Instants can now carry multiple key/value pairs in a single emission, and values may be numeric or strings. The spellings stay the same (`TRACE_INSTANT_KV` for the zero-category form and `TRACE_INSTANT_CKV` when you want a category), but under the hood they route to a variadic, type-aware path. If you were previously constrained to a single numeric value, that limitation is gone; mixed sets like `("phase", 2, "stage", "copy", "ok", 1)` are valid and preserved in the output JSON. Nothing about the semantics of instants changed: they are still zero-duration markers with arguments serialized under `args`. The only difference is expressive power and fewer calls on the hot path when you want to attach several small facts to the same moment.
 
 ```cpp
-// single numeric KV TRACE_INSTANT_KV("speed", "mps", 12.5);  // single string KV TRACE_INSTANT_KV("note", "text", "hello world");  // multiple KVs with a category; mixed numeric+string TRACE_INSTANT_CKV("tick", "frame",                   "phase", 2,                   "stage", "copy",                   "ok",    1);  // standard library strings are accepted directly std::string label = "ready"; TRACE_INSTANT_KV("status", "label", label);  std::string_view sv = "hello"; TRACE_INSTANT_KV("greet", "text", sv);
+// single numeric KV
+TRACE_INSTANT_KV("speed", "mps", 12.5);
+
+// single string KV
+TRACE_INSTANT_KV("note", "text", "hello world");
+
+// multiple KVs with a category; mixed numeric+string
+TRACE_INSTANT_CKV("tick", "frame",
+                  "phase", 2,
+                  "stage", "copy",
+                  "ok",    1);
+
+// standard library strings are accepted directly
+std::string label = "ready";
+TRACE_INSTANT_KV("status", "label", label);
+
+std::string_view sv = "hello";
+TRACE_INSTANT_KV("greet", "text", sv);
 ```
 
 **Rationale**
@@ -15,7 +32,13 @@ The previous “one numeric KV per instant” design forced either multiple inst
 The JSON remains Chrome Trace Event compatible. Each instant appears with `"ph":"I"` and all supplied key/values folded under `args`. Strings are emitted as JSON strings; numbers are emitted as JSON numbers. Perfetto reads this directly.
 
 ```json
-{   "ph": "I",   "name": "tick",   "cat": "frame",   "ts": 1234567,   "args": { "phase": 2, "stage": "copy", "ok": 1 } }
+{
+  "ph": "I",
+  "name": "tick",
+  "cat": "frame",
+  "ts": 1234567,
+  "args": { "phase": 2, "stage": "copy", "ok": 1 }
+}
 ```
 
 **Performance and boundaries**
@@ -31,7 +54,13 @@ Values are accepted if they are arithmetic or string-like. String-like covers `c
 Only instants gained variadic and string-aware arguments. `TRACE_SCOPE_KV` and `TRACE_SCOPE_CKV` stay single-numeric on purpose to keep the RAII path compact and predictable in very hot code. If you need several labels at a specific entry or exit point, attach them with a single instant inside the scope.
 
 ```cpp
-{   TRACE_SCOPE_C("render_pass", "gpu");   TRACE_INSTANT_CKV("pass_meta", "gpu",                     "triangles", triangle_count,                     "technique", "forward+");   // …heavy work… }
+{
+  TRACE_SCOPE_C("render_pass", "gpu");
+  TRACE_INSTANT_CKV("pass_meta", "gpu",
+                    "triangles", triangle_count,
+                    "technique", "forward+");
+  // …heavy work…
+}
 ```
 
 **Compatibility and migration**
