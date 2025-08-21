@@ -1,6 +1,5 @@
 #ifndef OTRACE_HPP_INCLUDED
 #define OTRACE_HPP_INCLUDED
-
 /**
  * @file    otrace.hpp
  * @brief   Header-only in-process timeline instrumentation for Perfetto / Chrome Trace Event JSON.
@@ -20,21 +19,41 @@
  *   -DOTRACE_ON_EXIT=1                 Auto-flush at process exit (default 1)
  *   -DOTRACE_CLOCK=1|2|3               1=steady_clock, 2=RDTSC(x86), 3=system_clock
  *   -DOTRACE_MAX_ARGS=N                Max args per event (default 4)
+ *   -DOTRACE_NO_SHORT_MACROS=1         Hide TRACE_* aliases; use OTRACE_* only (default 0)
+ *
+ * Environment variables (read once on first use):
+ *   OTRACE_DISABLE=1                   Disable recording
+ *   OTRACE_ENABLE=1                    Enable recording (wins over DISABLE)
+ *   OTRACE_SAMPLE=0.10                 Keep probability for sampling (0..1)
  *
  * Public API (when OTRACE==1) — examples:
- *   TRACE_SCOPE("step");                              // complete slice (ph:"X")
- *   TRACE_BEGIN("upload"); TRACE_END("upload");       // begin/end pair
- *   TRACE_INSTANT("tick");                            // instant (ph:"i")
- *   TRACE_INSTANT_C("tick","frame");                  // instant with category
- *   TRACE_INSTANT_CKV("tick","frame","phase",42);     // instant with key/value
- *   TRACE_COUNTER("queue_len", n);                    // counter sample
+ *   // Scopes & events
+ *   TRACE_SCOPE("step");                              // or OTRACE_SCOPE
+ *   TRACE_BEGIN("upload"); TRACE_END("upload");
+ *   TRACE_INSTANT_CKV("tick","frame","phase",42);
+ *   TRACE_COUNTER("queue_len", n);
  *   TRACE_FLOW_BEGIN(id); TRACE_FLOW_STEP(id); TRACE_FLOW_END(id);
  *   TRACE_MARK_FRAME(i); TRACE_MARK_FRAME_S("present");
+ *
+ *   // Metadata, colors, output
  *   TRACE_SET_THREAD_NAME("worker-0"); TRACE_SET_PROCESS_NAME("my-app");
  *   TRACE_SET_THREAD_SORT_INDEX(10);
- *   TRACE_COLOR("good");                              // color hint for next event
- *   TRACE_SET_OUTPUT_PATH("trace.json");              // set output path at runtime
- *   TRACE_FLUSH(nullptr);                             // force flush now
+ *   TRACE_COLOR("good");
+ *   TRACE_SET_OUTPUT_PATH("trace.json"); TRACE_FLUSH(nullptr);
+ *
+ *   // Filters & sampling (new)
+ *   OTRACE_SET_FILTER(my_filter_fn);                 // bool(const char* name, const char* cat)
+ *   OTRACE_ENABLE_CATS("io,frame");                  // allowlist categories
+ *   OTRACE_DISABLE_CATS("debug,noise");              // denylist categories
+ *   OTRACE_SET_SAMPLING(0.1);                        // keep 10% of events
+ *
+ *   // Call-by-name macro (optional sugar)
+ *   OTRACE_CALL(SCOPE, "init");                      // expands to OTRACE_SCOPE("init")
+ *   OTRACE_CALL(COUNTER, "queue_len", v);            // expands to OTRACE_COUNTER(...)
+ *
+ * Notes:
+ *   • Aliases TRACE_* are enabled by default; define OTRACE_NO_SHORT_MACROS=1 to hide them.
+ *   • A per-thread sequence number guarantees deterministic ordering for same-timestamp events.
  *
  * Requirements: C++17+, Windows/Linux/macOS. Not async-signal-safe.
  * SPDX-License-Identifier: MIT
@@ -121,6 +140,8 @@ namespace otrace {
   static inline uint64_t rdtsc() noexcept { return __rdtsc(); }
 #endif
 
+inline bool csv_has(const char* csv, const char* key);                   // forward
+inline bool should_emit(const char* name, const char* cat);              // forward
 struct AtExitHook;                   // forward
 inline AtExitHook& hook();           // forward
 inline uint32_t pid() {
@@ -267,6 +288,7 @@ struct Arg {
 struct Event {
   uint64_t ts_us;             // timestamp
   uint64_t dur_us;            // for Complete (X)
+  uint32_t seq;               // stable sequence per thread
   uint64_t flow_id;           // for flows (s/t/f)
   uint32_t pid;
   uint32_t tid;
@@ -288,6 +310,8 @@ struct Event {
 struct ThreadBuffer {
   ThreadBuffer* next;
   uint32_t      tid_v;
+  uint32_t      seq_ctr;
+  uint64_t      total_appends;    
   char          thread_name[OTRACE_MAX_NAME];
   int           thread_sort_index;
   Event*        buf;
@@ -297,7 +321,8 @@ struct ThreadBuffer {
   char          pending_cname[OTRACE_MAX_CNAME]; // color hint for next event only
 
   ThreadBuffer(uint32_t capacity)
-  : next(nullptr), tid_v(otrace::tid()), thread_sort_index(0), buf(nullptr), cap(capacity), head(0), wrapped(false) {
+  : next(nullptr), tid_v(otrace::tid()), thread_sort_index(0), buf(nullptr),
+    cap(capacity), head(0), wrapped(false), seq_ctr(0), total_appends(0) {
     thread_name[0] = '\0';
     pending_cname[0] = '\0';
     buf = new Event[cap];
@@ -305,20 +330,23 @@ struct ThreadBuffer {
 
   ~ThreadBuffer() { delete[] buf; }
 
-  Event* append() {
+Event* append() {
     uint32_t idx = head++;
+    total_appends++;
     if (head >= cap) { head = 0; wrapped = true; }
     Event* e = &buf[idx];
     // mark slot as in‑flight
     e->committed.store(0, std::memory_order_relaxed);
     // reset dynamic fields (cheap, skip large memsets)
-    e->argc = 0; e->dur_us = 0; e->flow_id = 0;
+    e->argc = 0; e->dur_us = 0; e->flow_id = 0; e->seq = ++seq_ctr;
     e->name[0]=0; e->cat[0]=0; 
     if (pending_cname[0]) { std::snprintf(e->cname, sizeof(e->cname), "%s", pending_cname); pending_cname[0]=0; }
     else e->cname[0]=0;
     return e;
   }
 };
+
+using OtraceFilter = bool(*)(const char* name, const char* cat);
 
 // Global registry of all thread buffers
 struct Registry {
@@ -328,11 +356,31 @@ struct Registry {
   char process_name[OTRACE_MAX_NAME];
   char default_path[256];
 
+  OtraceFilter filter = nullptr;
+  double sample_keep = 1.0;               // 0..1
+  char allow_cats[256];                   // CSV allowlist
+  char deny_cats[256];                    // CSV denylist
+
+  enum class FlushMode { PauseAppenders, Quiescent };
+  std::atomic<FlushMode> flush_mode { FlushMode::PauseAppenders };
+
+  // snapshots
+  std::atomic<uint32_t> snapshot_ms { 0 };
+  std::atomic<bool>     snapshot_stop { false };
+  std::thread           snapshot_thr;
+
+  // rotation/pattern (lightweight; gzip optional)
+  char pattern[256];                      // e.g. "traces/run-%Y%m%d-%H%M%S.json"
+  uint32_t max_files = 0;
+  uint32_t max_size_mb = 0;
+
   Registry() {
     process_name[0] = '\0';
     std::snprintf(default_path, sizeof(default_path), "%s", OTRACE_DEFAULT_PATH);
+    allow_cats[0]=deny_cats[0]=pattern[0]='\0';
   }
 };
+
 
 inline Registry& reg() { static Registry R; return R; }
 
@@ -498,6 +546,7 @@ inline bool enabled() {
 }
 
 inline void emit_begin(const char* name, const char* cat=nullptr) {
+  if (!should_emit(name, cat)) return;     
   if (!enabled()) return;
   Event* ev = get_tbuf()->append();
   fill_common(*ev, Phase::B, name, cat);
@@ -505,6 +554,7 @@ inline void emit_begin(const char* name, const char* cat=nullptr) {
 }
 
 inline void emit_end(const char* name, const char* cat=nullptr) {
+  if (!should_emit(name, cat)) return;     
   if (!enabled()) return;
   Event* ev = get_tbuf()->append();
   fill_common(*ev, Phase::E, name, cat);
@@ -512,6 +562,7 @@ inline void emit_end(const char* name, const char* cat=nullptr) {
 }
 
 inline void emit_instant(const char* name, const char* cat=nullptr) {
+  if (!should_emit(name, cat)) return;     
   if (!enabled()) return;
   Event* ev = get_tbuf()->append();
   fill_common(*ev, Phase::I, name, cat);
@@ -519,6 +570,7 @@ inline void emit_instant(const char* name, const char* cat=nullptr) {
 }
 
 inline void emit_instant_kv(const char* name, const char* key, double val, const char* cat=nullptr) {
+  if (!should_emit(name, cat)) return;     
   if (!enabled()) return;
   Event* ev = get_tbuf()->append();
   fill_common(*ev, Phase::I, name, cat);
@@ -527,6 +579,7 @@ inline void emit_instant_kv(const char* name, const char* key, double val, const
 }
 
 inline void emit_counter_n(const char* name, const char* cat, int n, const char** keys, const double* vals) {
+  if (!should_emit(name, cat)) return;     
   if (!enabled()) return;
   Event* ev = get_tbuf()->append();
   fill_common(*ev, Phase::C, name, cat);
@@ -585,14 +638,16 @@ inline void set_next_color(const char* cname) {
 }
     
 inline void emit_flow(Phase ph, uint64_t id, const char* name=nullptr, const char* cat=nullptr) {
-  if (!enabled()) return;
-  Event* ev = get_tbuf()->append();
   if (!name) name = "flow";
   if (!cat)  cat  = "flow";
+  if (!should_emit(name, cat)) return;
+  if (!enabled()) return;
+  Event* ev = get_tbuf()->append();
   fill_common(*ev, ph, name, cat);
   ev->flow_id = id;
   commit(ev);
 }
+
 
 // RAII scope -> Complete (X)
 struct Scope {
@@ -601,25 +656,42 @@ struct Scope {
   const char* arg_key;
   double arg_val;
   bool has_arg;
+  bool record;        
   uint64_t t0;
+
   Scope(const char* nm, const char* ct=nullptr)
-  : name(nm), cat(ct), arg_key(nullptr), arg_val(0), has_arg(false), t0(now_us()) {}
+  : name(nm), cat(ct), arg_key(nullptr), arg_val(0), has_arg(false) {
+    record = should_emit(name, cat);
+    t0 = record ? now_us() : 0;
+  }
+
   Scope(const char* nm, const char* ct, const char* key, double val)
-  : name(nm), cat(ct), arg_key(key), arg_val(val), has_arg(true), t0(now_us()) {}
+  : name(nm), cat(ct), arg_key(key), arg_val(val), has_arg(true) {
+    record = should_emit(name, cat);
+    t0 = record ? now_us() : 0;
+  }
+
   ~Scope() {
+    if (!record) return;
     uint64_t dur = now_us() - t0;
     if (has_arg) emit_complete_kv(name, dur, arg_key, arg_val, cat);
-    else emit_complete(name, dur, cat);
+    else         emit_complete(name, dur, cat);
   }
 };
+
 
 // ---- Flush ----------------------------------------------------------------
 
 struct CleanEvent {
   // copy‑friendly event for sorting/writing (no atomics)
-  uint64_t ts_us, dur_us, flow_id; uint32_t pid, tid; Phase ph; 
-  char name[OTRACE_MAX_NAME]; char cat[OTRACE_MAX_CAT]; char cname[OTRACE_MAX_CNAME];
+  uint64_t ts_us, dur_us, flow_id;
+  uint32_t pid, tid, seq; 
+  Phase ph;
+  char name[OTRACE_MAX_NAME];
+  char cat[OTRACE_MAX_CAT];
+  char cname[OTRACE_MAX_CNAME];
   uint8_t argc; Arg args[OTRACE_MAX_ARGS];
+
 };
 
 inline void set_output_path(const char* path) {
@@ -637,7 +709,9 @@ inline void collect_all(std::vector<CleanEvent>& out) {
       Event* src = &tb->buf[idx];
       if (!src->committed.load(std::memory_order_acquire)) continue; // skip in‑flight
       CleanEvent ce{};
-      ce.ts_us=src->ts_us; ce.dur_us=src->dur_us; ce.flow_id=src->flow_id; ce.pid=src->pid; ce.tid=src->tid; ce.ph=src->ph;
+      ce.ts_us=src->ts_us; ce.dur_us=src->dur_us; ce.flow_id=src->flow_id;
+      ce.pid=src->pid; ce.tid=src->tid; ce.seq=src->seq; 
+      ce.ph=src->ph;
       std::snprintf(ce.name,sizeof(ce.name),"%s",src->name);
       std::snprintf(ce.cat,sizeof(ce.cat),"%s",src->cat);
       std::snprintf(ce.cname,sizeof(ce.cname),"%s",src->cname);
@@ -668,9 +742,11 @@ inline void flush_file(const char* path) {
 
   // Sort for coherent timeline
   std::sort(all.begin(), all.end(), [](const CleanEvent& a, const CleanEvent& b){
-    if (a.ts_us == b.ts_us) { if (a.tid == b.tid) return (int)a.ph < (int)b.ph; return a.tid < b.tid; }
-    return a.ts_us < b.ts_us;
-  });
+  if (a.ts_us != b.ts_us) return a.ts_us < b.ts_us;
+  if (a.tid   != b.tid)   return a.tid   < b.tid;
+  return a.seq < b.seq; 
+ });
+
 
   const char* out_path = path ? path : reg().default_path;
   FILE* f = std::fopen(out_path, "wb");
@@ -693,9 +769,70 @@ inline void atexit_flush() {
   flush_file(reg().default_path);
 #endif
 }
+inline bool csv_has(const char* csv, const char* key) {
+  if (!csv || !csv[0] || !key || !key[0]) return false;
+  const char* p = csv;
+  size_t k = std::strlen(key);
+  while (*p) {
+    while (*p==',' || *p==' ' || *p=='\t') ++p;
+    const char* s = p;
+    while (*p && *p!=',') ++p;
+    size_t n = (size_t)(p - s);
+    if (n==k && std::strncmp(s, key, k)==0) return true;
+    if (*p==',') ++p;
+  }
+  return false;
+}
 
-struct AtExitHook { AtExitHook(){ std::atexit(atexit_flush); } };
+inline bool should_emit(const char* name, const char* cat) {
+  if (!reg().enabled.load(std::memory_order_relaxed)) return false;
+
+  // sampling
+  double keep = reg().sample_keep;
+  if (keep < 1.0) {
+    // tiny thread-local xorshift
+    thread_local uint64_t s = (uint64_t)otrace::tid() * 0x9E3779B97F4A7C15ull + now_us();
+    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+    // 53b mantissa -> [0,1)
+    double u = (double)((s >> 11) & ((1ull<<53)-1)) / (double)(1ull<<53);
+    if (u > keep) return false;
+  }
+
+  // allow/deny cats
+  if (reg().allow_cats[0] && !csv_has(reg().allow_cats, cat ? cat : "")) return false;
+  if (reg().deny_cats[0]  &&  csv_has(reg().deny_cats,  cat ? cat : "")) return false;
+
+  // user filter
+  auto f = reg().filter;
+  if (f && !f(name ? name : "", cat ? cat : "")) return false;
+
+  return true;
+}
+
+// One-time env read inside hook()
+struct AtEnvInit {
+  AtEnvInit() {
+    if (const char* d = std::getenv("OTRACE_DISABLE")) otrace::reg().enabled.store(false, std::memory_order_release);
+    if (const char* e = std::getenv("OTRACE_ENABLE"))  otrace::reg().enabled.store(true,  std::memory_order_release);
+    if (const char* s = std::getenv("OTRACE_SAMPLE"))  reg().sample_keep = std::atof(s);
+  }
+};
+inline AtEnvInit& envinit() { static AtEnvInit E; return E; }
+struct AtExitHook { AtExitHook(){ (void)envinit(); std::atexit(atexit_flush); } };
 inline AtExitHook& hook() { static AtExitHook H; return H; }
+
+// --- filter/sampling API (namespace-scope) ---
+inline void otrace_set_filter(OtraceFilter f) { reg().filter = f; }
+inline void otrace_enable_cats(const char* csv) {
+  std::snprintf(reg().allow_cats, sizeof(reg().allow_cats), "%s", csv ? csv : "");
+}
+inline void otrace_disable_cats(const char* csv) {
+  std::snprintf(reg().deny_cats, sizeof(reg().deny_cats), "%s", csv ? csv : "");
+}
+inline void otrace_set_sampling(double keep) {
+  if (keep < 0) keep = 0; if (keep > 1) keep = 1;
+  reg().sample_keep = keep;
+}
 
 } // namespace otrace
 
@@ -775,6 +912,11 @@ inline AtExitHook& hook() { static AtExitHook H; return H; }
   #define TRACE(name, ...) OTRACE_##name(__VA_ARGS__)
 #endif
 
+// Filters & sampling (public macros)
+#define OTRACE_SET_FILTER(fn)        do{ OTRACE_TOUCH(); ::otrace::otrace_set_filter((fn)); }while(0)
+#define OTRACE_ENABLE_CATS(csv)      do{ OTRACE_TOUCH(); ::otrace::otrace_enable_cats((csv)); }while(0)
+#define OTRACE_DISABLE_CATS(csv)     do{ OTRACE_TOUCH(); ::otrace::otrace_disable_cats((csv)); }while(0)
+#define OTRACE_SET_SAMPLING(p)       do{ OTRACE_TOUCH(); ::otrace::otrace_set_sampling((p)); }while(0)
 
 // ---- Optional short aliases (default ON unless OTRACE_NO_SHORT_MACROS) ----
 #if !OTRACE_NO_SHORT_MACROS
