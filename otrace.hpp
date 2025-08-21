@@ -4,8 +4,8 @@
  * @file    otrace.hpp
  * @brief   Header-only in-process timeline instrumentation for Perfetto / Chrome Trace Event JSON.
  * @author  DimitryQm
- * @version 0.1.0
- * @date    2025-08-20
+ * @version 0.2.0
+ * @date    2025-08-21
  * @license MIT
  * @see     https://ui.perfetto.dev/ , chrome://tracing
  *
@@ -18,8 +18,10 @@
  *   -DOTRACE_DEFAULT_PATH="file.json"  Output file (default "trace.json")
  *   -DOTRACE_ON_EXIT=1                 Auto-flush at process exit (default 1)
  *   -DOTRACE_CLOCK=1|2|3               1=steady_clock, 2=RDTSC(x86), 3=system_clock
- *   -DOTRACE_MAX_ARGS=N                Max args per event (default 4)
+ *   -DOTRACE_MAX_ARGS=N                Max key/values per event (default 4)
  *   -DOTRACE_NO_SHORT_MACROS=1         Hide TRACE_* aliases; use OTRACE_* only (default 0)
+ *   -DOTRACE_USE_ZLIB=1                Enable gzip for *.json.gz (zlib present)
+ *   -DOTRACE_USE_MINIZ=1               Enable gzip via bundled miniz (if you ship it)
  *
  * Environment variables (read once on first use):
  *   OTRACE_DISABLE=1                   Disable recording
@@ -30,19 +32,32 @@
  *   // Scopes & events
  *   TRACE_SCOPE("step");                              // or OTRACE_SCOPE
  *   TRACE_BEGIN("upload"); TRACE_END("upload");
- *   TRACE_INSTANT_CKV("tick","frame","phase",42);
+ *
+ *   // Instants with key/values(0.2.0+):
+ *   // • Values can be numbers or strings
+ *   // • You may pass multiple KVs in a single call (variadic)
+ *   // • Bounded by OTRACE_MAX_ARGS per event
+ *   TRACE_INSTANT_KV ("speed", "mps", 12.5);
+ *   TRACE_INSTANT_KV ("note",  "text", "hello world");
+ *   TRACE_INSTANT_CKV("tick", "frame", "phase", 42, "stage", "copy");
+ *
+ *   // Counters, flows, frames
  *   TRACE_COUNTER("queue_len", n);
  *   TRACE_FLOW_BEGIN(id); TRACE_FLOW_STEP(id); TRACE_FLOW_END(id);
  *   TRACE_MARK_FRAME(i); TRACE_MARK_FRAME_S("present");
  *
- *   // Metadata, colors, output
+ *   // Metadata, colors
  *   TRACE_SET_THREAD_NAME("worker-0"); TRACE_SET_PROCESS_NAME("my-app");
  *   TRACE_SET_THREAD_SORT_INDEX(10);
  *   TRACE_COLOR("good");
- *   TRACE_SET_OUTPUT_PATH("trace.json"); TRACE_FLUSH(nullptr);
  *
- *   // Filters & sampling (new)
- *   OTRACE_SET_FILTER(my_filter_fn);                 // bool(const char* name, const char* cat)
+ *   // Output control: single file or rotation (+optional gzip)
+ *   TRACE_SET_OUTPUT_PATH("trace.json");
+ *   TRACE_SET_OUTPUT_PATTERN("traces/run-%04u.json.gz", 64, 10)  // max_size_mb=64, max_files=10
+ *   TRACE_FLUSH(nullptr);
+ *
+ *   // Filters & sampling
+ *   OTRACE_SET_FILTER(+[](const char* name, const char* cat){ return cat && std::strcmp(cat,"io")==0; });
  *   OTRACE_ENABLE_CATS("io,frame");                  // allowlist categories
  *   OTRACE_DISABLE_CATS("debug,noise");              // denylist categories
  *   OTRACE_SET_SAMPLING(0.1);                        // keep 10% of events
@@ -50,14 +65,20 @@
  *   // Call-by-name macro (optional sugar)
  *   OTRACE_CALL(SCOPE, "init");                      // expands to OTRACE_SCOPE("init")
  *   OTRACE_CALL(COUNTER, "queue_len", v);            // expands to OTRACE_COUNTER(...)
+ *   // or with aliases (enabled by default):
+ *   TRACE(COUNTER, "queue_len", v);
  *
  * Notes:
- *   • Aliases TRACE_* are enabled by default; define OTRACE_NO_SHORT_MACROS=1 to hide them.
- *   • A per-thread sequence number guarantees deterministic ordering for same-timestamp events.
+ *   • If the pattern ends with ".gz", gzip is used only when built with OTRACE_USE_ZLIB=1 or OTRACE_USE_MINIZ=1;
+ *     otherwise a plain JSON file is written.
+ *   • TRACE_* aliases are enabled by default; define OTRACE_NO_SHORT_MACROS=1 to hide them.
+ *   • Env vars are read once on first use of the API in-process.
+ *   • Each key/value added to an event counts toward OTRACE_MAX_ARGS for that event.
  *
  * Requirements: C++17+, Windows/Linux/macOS. Not async-signal-safe.
  * SPDX-License-Identifier: MIT
  */
+
 
 #if !defined(__cplusplus) || __cplusplus < 201703L
 #  error "otrace.hpp requires C++17 or later"
@@ -91,6 +112,14 @@
 #define OTRACE_MAX_ARGS 4
 #endif
 
+#ifndef OTRACE_USE_ZLIB
+#define OTRACE_USE_ZLIB 0   // set to 1 to use system zlib for gzip (.gz)
+#endif
+#ifndef OTRACE_USE_MINIZ
+#define OTRACE_USE_MINIZ 0  // set to 1 to use bundled miniz (zlib-compat) for gzip
+#endif
+
+
 
 // Public Macros (no-ops when OTRACE == 0)
 #if OTRACE
@@ -107,19 +136,23 @@
 #include <algorithm>
 #include <string>
 #include <utility>
+#include <type_traits>
 
 #if defined(_WIN32)
   #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
   #include <processthreadsapi.h>
+  #include <sys/stat.h>
 #elif defined(__APPLE__)
   #include <pthread.h>
   #include <sys/types.h>
   #include <unistd.h>
+  #include <sys/stat.h>
 #else
   #include <sys/syscall.h>
   #include <sys/types.h>
   #include <unistd.h>
+  #include <sys/stat.h>  
 #endif
 
 #if OTRACE_CLOCK==2 && (defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64))
@@ -131,6 +164,13 @@
     #include <immintrin.h>
   #endif
 #endif
+
+#if OTRACE_USE_ZLIB
+  #include <zlib.h>
+#elif OTRACE_USE_MINIZ
+  #include "miniz.h"
+#endif
+
 
 
 namespace otrace {
@@ -373,6 +413,11 @@ struct Registry {
   char pattern[256];                      // e.g. "traces/run-%Y%m%d-%H%M%S.json"
   uint32_t max_files = 0;
   uint32_t max_size_mb = 0;
+  // rotation state
+  uint32_t rot_index = 0;
+  bool     pattern_has_index = false; // true if pattern contains a %d
+  bool     pattern_use_gzip  = false; // true if pattern ends with .gz and gzip is available
+
 
   Registry() {
     process_name[0] = '\0';
@@ -606,6 +651,41 @@ inline void emit_complete_kv(const char* name, uint64_t dur_us, const char* key,
   commit(ev);
 }
 
+
+// ---- Variadic KV helpers for instants (numbers and strings) ----
+template <class V>
+inline void otrace_add_one_kv(Event& e, const char* key, V&& v) {
+  if constexpr (std::is_convertible_v<V, const char*> ||
+                std::is_same_v<std::decay_t<V>, std::string>) {
+    arg_string(e, key, v);
+  } else {
+    arg_number(e, key, static_cast<double>(v));
+  }
+}
+inline void otrace_add_kvs(Event&) {}
+
+template <class V, class... Rest>
+inline void otrace_add_kvs(Event& e, const char* key, V&& v, Rest&&... rest) {
+  otrace_add_one_kv(e, key, std::forward<V>(v));
+  if constexpr (sizeof...(rest) > 0) {
+    otrace_add_kvs(e, std::forward<Rest>(rest)...);
+  }
+}
+
+template <class... KVs>
+inline void emit_instant_kvs(const char* name, const char* cat, KVs&&... kvs) {
+  static_assert(sizeof...(kvs) % 2 == 0, "emit_instant_kvs expects key/value pairs");
+  if (!should_emit(name, cat)) return;
+  if (!enabled()) return;
+  Event* ev = get_tbuf()->append();
+  fill_common(*ev, Phase::I, name, cat);
+  if constexpr (sizeof...(kvs) > 0) {
+    otrace_add_kvs(*ev, std::forward<KVs>(kvs)...);
+  }
+  commit(ev);
+}
+
+
 inline void emit_thread_name(const char* name) {
   if (!enabled()) return;
   ThreadBuffer* tb = get_tbuf();
@@ -693,6 +773,8 @@ struct CleanEvent {
   uint8_t argc; Arg args[OTRACE_MAX_ARGS];
 
 };
+    
+#define OTRACE_HAVE_CLEAN_SEQ 1
 
 inline void set_output_path(const char* path) {
   if (!path) return;
@@ -733,36 +815,263 @@ inline void collect_all(std::vector<CleanEvent>& out) {
   }
 }
 
+
+
+// --- rotation/gzip helpers -------------------------------------------------
+
+inline bool ends_with(const char* s, const char* suff) {
+  if (!s || !suff) return false;
+  size_t n = std::strlen(s), m = std::strlen(suff);
+  return (m <= n) && (std::memcmp(s + (n - m), suff, m) == 0);
+}
+
+inline void format_indexed(char* out, size_t out_sz, const char* pattern, uint32_t idx, bool has_index) {
+  if (!pattern || !pattern[0]) { out[0]='\0'; return; }
+  if (has_index) {
+    std::snprintf(out, out_sz, pattern, (unsigned)idx);
+  } else {
+    // If no %d, append "-%06u"
+    std::snprintf(out, out_sz, "%s-%06u", pattern, (unsigned)idx);
+  }
+}
+
+inline void make_tmp_path(char* out, size_t out_sz, const char* final_path) {
+  std::snprintf(out, out_sz, "%s.tmp", final_path ? final_path : "trace.json");
+}
+
+inline uint64_t file_size_bytes(const char* path) {
+  if (!path) return 0;
+#if defined(_WIN32)
+  struct _stat64 st; if (_stat64(path, &st) == 0) return (uint64_t)st.st_size; else return 0;
+#else
+  struct stat st; if (stat(path, &st) == 0) return (uint64_t)st.st_size; else return 0;
+#endif
+}
+
+// Write JSON trace to a FILE*
+inline void write_trace_json_FILE(FILE* f, const std::vector<CleanEvent>& all) {
+  std::fputs("{\n\"traceEvents\":[\n", f);
+  for (size_t i = 0; i < all.size(); ++i) {
+    write_event_json_common(f, all[i]);
+    if (i + 1 != all.size()) std::fputs(",\n", f);
+  }
+  std::fputs("\n],\n\"displayTimeUnit\":\"ms\"\n}\n", f);
+}
+
+#if OTRACE_USE_ZLIB || OTRACE_USE_MINIZ
+// Stream-compress a whole file to gzip (.gz) using zlib-compatible API.
+inline bool compress_file_to_gzip(const char* in_path, const char* out_path, int level /*1..9*/) {
+  if (!in_path || !out_path) return false;
+  FILE* fin = std::fopen(in_path, "rb");
+  if (!fin) return false;
+  FILE* fout = std::fopen(out_path, "wb");
+  if (!fout) { std::fclose(fin); return false; }
+
+  // zlib/miniz stream
+  z_stream zs{};
+  // windowBits=15, +16 -> gzip header/trailer
+  int rc = deflateInit2(&zs, level, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY);
+  if (rc != Z_OK) { std::fclose(fin); std::fclose(fout); return false; }
+
+  const size_t IN_CHUNK  = 256 * 1024;
+  const size_t OUT_CHUNK = 256 * 1024;
+  std::vector<unsigned char> inbuf(IN_CHUNK);
+  std::vector<unsigned char> outbuf(OUT_CHUNK);
+
+  bool ok = true;
+  for (;;) {
+    zs.avail_in = (uInt)std::fread(inbuf.data(), 1, IN_CHUNK, fin);
+    zs.next_in  = inbuf.data();
+    int flush = std::feof(fin) ? Z_FINISH : Z_NO_FLUSH;
+
+    do {
+      zs.avail_out = (uInt)OUT_CHUNK;
+      zs.next_out  = outbuf.data();
+      rc = deflate(&zs, flush);
+      if (rc == Z_STREAM_ERROR) { ok = false; break; }
+      size_t have = OUT_CHUNK - zs.avail_out;
+      if (have && std::fwrite(outbuf.data(), 1, have, fout) != have) { ok = false; break; }
+    } while (zs.avail_out == 0);
+
+    if (!ok || flush == Z_FINISH) break;
+  }
+
+  deflateEnd(&zs);
+  std::fclose(fin);
+  if (std::fclose(fout) != 0) ok = false;
+
+  if (!ok) {
+    // Best-effort cleanup
+#if defined(_WIN32)
+    _unlink(out_path);
+#else
+    unlink(out_path);
+#endif
+  }
+  return ok;
+}
+#endif // OTRACE_USE_ZLIB || OTRACE_USE_MINIZ
+
+// Configure rotation + optional gzip
+inline void set_output_pattern(const char* pattern, uint32_t max_size_mb, uint32_t max_files) {
+  Registry& R = reg();
+  if (!pattern || !pattern[0]) {
+    R.pattern[0] = '\0';
+    R.pattern_has_index = false;
+    R.pattern_use_gzip = false;
+    R.max_files = 0; R.max_size_mb = 0; R.rot_index = 0;
+    return;
+  }
+
+  std::snprintf(R.pattern, sizeof(R.pattern), "%s", pattern);
+  R.max_files   = (max_files == 0 ? 1u : max_files);
+  R.max_size_mb = max_size_mb;
+
+  // cheap scan: contains any %<...>d sequence?
+  R.pattern_has_index = false;
+  for (const char* p = R.pattern; *p; ++p) {
+    if (*p == '%') {
+      ++p;
+      // skip flags/width/precision like %04d etc.
+      while (*p && std::strchr("0-+ #", *p)) ++p;
+      while (*p && (*p >= '0' && *p <= '9')) ++p;
+      if (*p == 'd' || *p == 'u') { R.pattern_has_index = true; break; }
+    }
+  }
+
+  // gzip if .gz suffix AND a gzip backend is available
+  bool want_gz = ends_with(R.pattern, ".gz");
+#if OTRACE_USE_ZLIB || OTRACE_USE_MINIZ
+  R.pattern_use_gzip = want_gz;
+#else
+  R.pattern_use_gzip = false; // no gzip backend compiled in
+#endif
+  R.rot_index = 0;
+}
+
+// The big “do-it-all” rotated writer. Writes one fresh file per flush:
+// - Builds final path from pattern + rot_index (optionally appending "-%06u")
+// - Writes JSON to a .tmp
+// - Optionally gzips .tmp -> final .gz (needs zlib/miniz)
+// - Renames .tmp -> final if not gzipping
+// - Bumps rot_index and enforces max_files via wrap-around naming.
+inline void write_rotated_trace(const std::vector<CleanEvent>& all) {
+  Registry& R = reg();
+  char final_path[512], tmp_path[512];
+
+  // choose target path
+  format_indexed(final_path, sizeof(final_path), R.pattern, R.rot_index, R.pattern_has_index);
+
+  // Safety: if pattern ends with .gz but gzip is not available, drop suffix
+  char adjusted_final[512];
+  if (ends_with(final_path, ".gz") && !R.pattern_use_gzip) {
+    std::snprintf(adjusted_final, sizeof(adjusted_final), "%.*s",
+                  (int)(std::strlen(final_path) - 3), final_path);
+  } else {
+    std::snprintf(adjusted_final, sizeof(adjusted_final), "%s", final_path);
+  }
+
+  make_tmp_path(tmp_path, sizeof(tmp_path), adjusted_final);
+
+  // 1) Write plain JSON into tmp file
+  FILE* ftmp = std::fopen(tmp_path, "wb");
+  if (!ftmp) return;
+  write_trace_json_FILE(ftmp, all);
+  std::fclose(ftmp);
+
+  // Enforce max size *post factum* (we don't split): if too big, we still keep it.
+  // This knob is mostly advisory for now.
+  (void)R.max_size_mb; // reserved for future chunking
+
+  // 2) If gzip requested and available, compress tmp -> final.gz
+  bool wrote_ok = true;
+  if (R.pattern_use_gzip && ends_with(final_path, ".gz")) {
+#if OTRACE_USE_ZLIB || OTRACE_USE_MINIZ
+    wrote_ok = compress_file_to_gzip(tmp_path, final_path, 6 /*balanced*/);
+#else
+    wrote_ok = false;
+#endif
+    // remove tmp either way
+#if defined(_WIN32)
+    _unlink(tmp_path);
+#else
+    unlink(tmp_path);
+#endif
+  } else {
+    // 3) No gzip: rename tmp -> final (overwrite)
+#if defined(_WIN32)
+    _unlink(adjusted_final); // ensure we can replace
+    wrote_ok = (0 == std::rename(tmp_path, adjusted_final));
+#else
+    // POSIX rename is atomic
+    wrote_ok = (0 == std::rename(tmp_path, adjusted_final));
+#endif
+    if (!wrote_ok) {
+      // fallback: copy+unlink
+      FILE* src = std::fopen(tmp_path, "rb");
+      FILE* dst = std::fopen(adjusted_final, "wb");
+      if (src && dst) {
+        char buf[256*1024];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof(buf), src)) != 0) {
+          if (std::fwrite(buf, 1, n, dst) != n) { wrote_ok = false; break; }
+        }
+      } else wrote_ok = false;
+      if (src) std::fclose(src);
+      if (dst) std::fclose(dst);
+#if defined(_WIN32)
+      _unlink(tmp_path);
+#else
+      unlink(tmp_path);
+#endif
+    }
+  }
+
+  // 4) Bump index (wrap)
+  R.rot_index = (R.rot_index + 1) % (R.max_files ? R.max_files : 1);
+}
+
+// public API wrapper
+inline void set_output_pattern_api(const char* pattern, uint32_t max_size_mb, uint32_t max_files) {
+  set_output_pattern(pattern, max_size_mb, max_files);
+}
+
+
 inline void flush_file(const char* path) {
-  // Pause new writes without blocking in‑flight ones
+  // Pause new writes without blocking in-flight ones
   bool prev = reg().enabled.exchange(false, std::memory_order_acq_rel);
 
   std::vector<CleanEvent> all; all.reserve(4096);
   collect_all(all);
 
-  // Sort for coherent timeline
+  // Sort for coherent timeline (ts, tid, seq if present)
   std::sort(all.begin(), all.end(), [](const CleanEvent& a, const CleanEvent& b){
-  if (a.ts_us != b.ts_us) return a.ts_us < b.ts_us;
-  if (a.tid   != b.tid)   return a.tid   < b.tid;
-  return a.seq < b.seq; 
- });
+    if (a.ts_us != b.ts_us) return a.ts_us < b.ts_us;
+    if (a.tid   != b.tid)   return a.tid   < b.tid;
+#ifdef OTRACE_HAVE_CLEAN_SEQ
+    return a.seq < b.seq;
+#else
+    return (int)a.ph < (int)b.ph;
+#endif
+  });
 
+  // If rotation is configured, use it (ignores 'path')
+  if (reg().pattern[0]) {
+    write_rotated_trace(all);
+    reg().enabled.store(prev, std::memory_order_release);
+    return;
+  }
 
+  // Legacy single-file path
   const char* out_path = path ? path : reg().default_path;
   FILE* f = std::fopen(out_path, "wb");
   if (!f) { reg().enabled.store(prev, std::memory_order_release); return; }
 
-  std::fputs("{\n\"traceEvents\":[\n", f);
-  for (size_t i = 0; i < all.size(); ++i) {
-    write_event_json_common(f, all[i]);  
-    if (i + 1 != all.size()) std::fputs(",\n", f);
-  }
-std::fputs("\n],\n\"displayTimeUnit\":\"ms\"\n}\n", f);
-
+  write_trace_json_FILE(f, all);
   std::fclose(f);
 
   reg().enabled.store(prev, std::memory_order_release);
-}
+}    
 
 inline void atexit_flush() {
 #if OTRACE_ON_EXIT
@@ -852,20 +1161,26 @@ inline void otrace_set_sampling(double keep) {
 
 // RAII scopes
 #define OTRACE_SCOPE(name) \
-  ::otrace::Scope _otrace_scope_##__LINE__( \
+  ::otrace::Scope OTRACE_PP_CAT(_otrace_scope_, __LINE__)( \
     ([&](){ (void)::otrace::hook(); return (name); }()) )
 
 #define OTRACE_SCOPE_C(name, cat) \
-  ::otrace::Scope _otrace_scope_##__LINE__( \
+  ::otrace::Scope OTRACE_PP_CAT(_otrace_scope_, __LINE__)( \
     ([&](){ (void)::otrace::hook(); return (name); }()), (cat) )
 
 #define OTRACE_SCOPE_KV(name, key, val) \
-  ::otrace::Scope _otrace_scope_##__LINE__( \
+  ::otrace::Scope OTRACE_PP_CAT(_otrace_scope_, __LINE__)( \
     ([&](){ (void)::otrace::hook(); return (name); }()), nullptr, (key), (double)(val) )
 
 #define OTRACE_SCOPE_CKV(name, cat, key, val) \
-  ::otrace::Scope _otrace_scope_##__LINE__( \
+  ::otrace::Scope OTRACE_PP_CAT(_otrace_scope_, __LINE__)( \
     ([&](){ (void)::otrace::hook(); return (name); }()), (cat), (key), (double)(val) )
+
+
+#ifndef OTRACE_PP_CAT
+#define OTRACE_PP_CAT(a,b) OTRACE_PP_CAT_I(a,b)
+#define OTRACE_PP_CAT_I(a,b) a##b
+#endif
 
 #define OTRACE_ZONE(name)            OTRACE_SCOPE_C((name), "zone")
 
@@ -878,8 +1193,9 @@ inline void otrace_set_sampling(double keep) {
 // Instants
 #define OTRACE_INSTANT(name)         do{ OTRACE_TOUCH(); otrace::emit_instant((name), nullptr); }while(0)
 #define OTRACE_INSTANT_C(name, cat)  do{ OTRACE_TOUCH(); otrace::emit_instant((name), (cat)); }while(0)
-#define OTRACE_INSTANT_KV(name, key, val) do{ OTRACE_TOUCH(); otrace::emit_instant_kv((name), (key), (double)(val), nullptr); }while(0)
-#define OTRACE_INSTANT_CKV(name, cat, key, val) do{ OTRACE_TOUCH(); otrace::emit_instant_kv((name), (key), (double)(val), (cat)); }while(0)
+#define OTRACE_INSTANT_KV(name, key, val) do{ OTRACE_TOUCH(); otrace::emit_instant_kvs((name), nullptr, (key), (val)); }while(0)
+#define OTRACE_INSTANT_CKV(name, cat, ...) do{ OTRACE_TOUCH(); otrace::emit_instant_kvs((name), (cat), __VA_ARGS__); }while(0)
+
 
 // Frames
 #define OTRACE_MARK_FRAME(idx)       do{ OTRACE_TOUCH(); otrace::emit_instant_kv("frame", "frame", (double)(idx), "frame"); }while(0)
@@ -904,6 +1220,9 @@ inline void otrace_set_sampling(double keep) {
 // Output
 #define OTRACE_FLUSH(path)           do{ OTRACE_TOUCH(); otrace::flush_file((path)); }while(0)
 #define OTRACE_SET_OUTPUT_PATH(path) do{ OTRACE_TOUCH(); otrace::set_output_path((path)); }while(0)
+// Rotation + gzip (pattern may contain %d or %0Nd for index; ".gz" honored if gzip backend is compiled)
+#define OTRACE_SET_OUTPUT_PATTERN(pattern, max_size_mb, max_files) \
+  do{ OTRACE_TOUCH(); ::otrace::set_output_pattern_api((pattern), (uint32_t)(max_size_mb), (uint32_t)(max_files)); }while(0)
 
 
 // Call-by-name single macro: OTRACE_CALL(SCOPE, "name"), OTRACE_CALL(COUNTER, "n", v), etc.
@@ -959,6 +1278,7 @@ inline void otrace_set_sampling(double keep) {
 
   #define TRACE_FLUSH(...)                   OTRACE_FLUSH(__VA_ARGS__)
   #define TRACE_SET_OUTPUT_PATH(...)         OTRACE_SET_OUTPUT_PATH(__VA_ARGS__)
+  #define TRACE_SET_OUTPUT_PATTERN(...)  OTRACE_SET_OUTPUT_PATTERN(__VA_ARGS__)
 #endif
 
 #else  // OTRACE disabled -----------------------------------------------------
