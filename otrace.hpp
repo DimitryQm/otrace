@@ -22,7 +22,10 @@
  *   -DOTRACE_NO_SHORT_MACROS=1         Hide TRACE_* aliases; use OTRACE_* only (default 0)
  *   -DOTRACE_USE_ZLIB=1                Enable gzip for *.json.gz (zlib present)
  *   -DOTRACE_USE_MINIZ=1               Enable gzip via bundled miniz (if you ship it)
- *
+ *   -DOTRACE_SYNTHESIZE_TRACKS=1      Enable synthetic tracks at flush (default 0)
+ *   -DOTRACE_SYNTH_RATE_WINDOW_US=... Rolling window for FPS/rates (default 500000)
+ *   -DOTRACE_SYNTH_PCT_NAMES="..."    Percentiles for scope latency summary (default "p50,p95,p99")
+
  * Environment variables (read once on first use):
  *   OTRACE_DISABLE=1                   Disable recording
  *   OTRACE_ENABLE=1                    Enable recording (wins over DISABLE)
@@ -67,6 +70,10 @@
  *   OTRACE_CALL(COUNTER, "queue_len", v);            // expands to OTRACE_COUNTER(...)
  *   // or with aliases (enabled by default):
  *   TRACE(COUNTER, "queue_len", v);
+ 
+ *   // Synthesis (if compiled in)
+ *   OTRACE_ENABLE_SYNTH_TRACKS(true);  // optional runtime toggle
+
  *
  * Notes:
  *   • If the pattern ends with ".gz", gzip is used only when built with OTRACE_USE_ZLIB=1 or OTRACE_USE_MINIZ=1;
@@ -119,6 +126,16 @@
 #define OTRACE_USE_MINIZ 0  // set to 1 to use bundled miniz (zlib-compat) for gzip
 #endif
 
+#ifndef OTRACE_SYNTHESIZE_TRACKS
+#define OTRACE_SYNTHESIZE_TRACKS 0
+#endif
+#ifndef OTRACE_SYNTH_RATE_WINDOW_US
+#define OTRACE_SYNTH_RATE_WINDOW_US 500000  // 0.5s
+#endif
+#ifndef OTRACE_SYNTH_PCT_NAMES
+#define OTRACE_SYNTH_PCT_NAMES "p50,p95,p99"
+#endif
+
 
 
 // Public Macros (no-ops when OTRACE == 0)
@@ -137,6 +154,13 @@
 #include <string>
 #include <utility>
 #include <type_traits>
+#include <map>
+#include <cmath>
+
+
+#if __cplusplus >= 201703L
+  #include <string_view>
+#endif
 
 #if defined(_WIN32)
   #define WIN32_LEAN_AND_MEAN
@@ -418,11 +442,49 @@ struct Registry {
   bool     pattern_has_index = false; // true if pattern contains a %d
   bool     pattern_use_gzip  = false; // true if pattern ends with .gz and gzip is available
 
+  // synthesis (post-process at flush)
+  std::atomic<bool> synth_enabled { OTRACE_SYNTHESIZE_TRACKS != 0 };
+
+  struct SynthCfg {
+    uint64_t rate_window_us;
+    uint32_t pct_count;
+    double   pct_vals[8];          // 0..1 (e.g. 0.50, 0.95, 0.99)
+    char     pct_names[8][8];      // labels (e.g. "p50")
+  } synth;
+
 
   Registry() {
     process_name[0] = '\0';
     std::snprintf(default_path, sizeof(default_path), "%s", OTRACE_DEFAULT_PATH);
     allow_cats[0]=deny_cats[0]=pattern[0]='\0';
+    // synth defaults
+    synth.rate_window_us = (uint64_t)OTRACE_SYNTH_RATE_WINDOW_US;
+    synth.pct_count = 0;
+    // parse OTRACE_SYNTH_PCT_NAMES at startup
+    {
+      const char* csv = OTRACE_SYNTH_PCT_NAMES;
+      while (*csv && synth.pct_count < 8) {
+        while (*csv==',' || *csv==' ' || *csv=='\t') ++csv;
+        const char* s = csv;
+        while (*csv && *csv!=',') ++csv;
+        size_t n = (size_t)(csv - s);
+        if (n > 0 && n < sizeof(synth.pct_names[0])) {
+          std::snprintf(synth.pct_names[synth.pct_count], sizeof(synth.pct_names[0]), "%.*s", (int)n, s);
+          // accept formats: "p50" or "50" -> 0.50
+          const char* p = synth.pct_names[synth.pct_count];
+          if (p[0]=='p' || p[0]=='P') ++p;
+          double v = std::atof(p) / 100.0;
+          if (v > 0.0 && v < 1.0) {
+            synth.pct_vals[synth.pct_count++] = v;
+          }
+        }
+        if (*csv == ',') ++csv;
+      }
+      if (synth.pct_count == 0) { // fallback
+        std::snprintf(synth.pct_names[0], sizeof(synth.pct_names[0]), "p50"); synth.pct_vals[0] = 0.50; synth.pct_count = 1;
+      }
+    }
+
   }
 };
 
@@ -635,6 +697,7 @@ inline void emit_counter_n(const char* name, const char* cat, int n, const char*
 }
 
 inline void emit_complete(const char* name, uint64_t dur_us, const char* cat=nullptr) {
+  if (!should_emit(name, cat)) return;
   if (!enabled()) return;
   Event* ev = get_tbuf()->append();
   fill_common(*ev, Phase::X, name, cat);
@@ -643,6 +706,7 @@ inline void emit_complete(const char* name, uint64_t dur_us, const char* cat=nul
 }
 
 inline void emit_complete_kv(const char* name, uint64_t dur_us, const char* key, double val, const char* cat=nullptr) {
+  if (!should_emit(name, cat)) return;
   if (!enabled()) return;
   Event* ev = get_tbuf()->append();
   fill_common(*ev, Phase::X, name, cat);
@@ -651,17 +715,29 @@ inline void emit_complete_kv(const char* name, uint64_t dur_us, const char* key,
   commit(ev);
 }
 
-
 // ---- Variadic KV helpers for instants (numbers and strings) ----
-template <class V>
-inline void otrace_add_one_kv(Event& e, const char* key, V&& v) {
-  if constexpr (std::is_convertible_v<V, const char*> ||
-                std::is_same_v<std::decay_t<V>, std::string>) {
-    arg_string(e, key, v);
-  } else {
-    arg_number(e, key, static_cast<double>(v));
-  }
+// String-like overloads first
+inline void otrace_add_one_kv(Event& e, const char* key, const char* v) {
+  arg_string(e, key, v ? v : "");
 }
+inline void otrace_add_one_kv(Event& e, const char* key, const std::string& v) {
+  arg_string(e, key, v.c_str());
+}
+#if __cplusplus >= 201703L
+inline void otrace_add_one_kv(Event& e, const char* key, std::string_view v) {
+  char tmp[OTRACE_MAX_ARGV];
+  if (v.size() >= sizeof(tmp)) v = v.substr(0, sizeof(tmp)-1);
+  std::snprintf(tmp, sizeof(tmp), "%.*s", (int)v.size(), v.data());
+  arg_string(e, key, tmp);
+}
+#endif
+
+// Numeric & bool fallback (SFINAE so it doesn't collide with string overloads)
+template <class V, typename = std::enable_if_t<std::is_arithmetic_v<std::decay_t<V>>>>
+inline void otrace_add_one_kv(Event& e, const char* key, V&& v) {
+  arg_number(e, key, static_cast<double>(v));
+}
+
 inline void otrace_add_kvs(Event&) {}
 
 template <class V, class... Rest>
@@ -684,7 +760,6 @@ inline void emit_instant_kvs(const char* name, const char* cat, KVs&&... kvs) {
   }
   commit(ev);
 }
-
 
 inline void emit_thread_name(const char* name) {
   if (!enabled()) return;
@@ -817,6 +892,121 @@ inline void collect_all(std::vector<CleanEvent>& out) {
 
 
 
+// ---- Synthetic tracks at flush (optional) ---------------------------------
+#if OTRACE_SYNTHESIZE_TRACKS
+inline void synthesize_tracks(const std::vector<CleanEvent>& in,
+                              std::vector<CleanEvent>& out,
+                              const Registry::SynthCfg& cfg) {
+  // helpers to emit counters/instants
+  auto emit_counter = [&](uint64_t ts, const char* name, const char* key, double val,
+                          uint32_t pid, uint32_t tid=0, const char* cat="synth") {
+    CleanEvent ce{}; ce.ts_us=ts; ce.pid=pid; ce.tid=tid; ce.ph=Phase::C;
+    std::snprintf(ce.name,sizeof(ce.name),"%s", name);
+    std::snprintf(ce.cat, sizeof(ce.cat), "%s", cat);
+    ce.argc=1;
+    std::snprintf(ce.args[0].key,sizeof(ce.args[0].key),"%s", key?key:"value");
+    ce.args[0].kind=ArgKind::Number; ce.args[0].num=val;
+    out.push_back(ce);
+  };
+  auto emit_instant = [&](uint64_t ts, const char* name, uint32_t pid, uint32_t tid=0,
+                          const char* cat="synth") {
+    CleanEvent ce{}; ce.ts_us=ts; ce.pid=pid; ce.tid=tid; ce.ph=Phase::I;
+    std::snprintf(ce.name,sizeof(ce.name),"%s", name);
+    std::snprintf(ce.cat, sizeof(ce.cat), "%s", cat);
+    out.push_back(ce);
+    return &out.back();
+  };
+
+  // gather basics
+  uint32_t pid = reg().pid_v;
+  uint64_t last_ts = 0;
+  for (auto& e : in) if (e.ts_us > last_ts) last_ts = e.ts_us;
+
+  // FPS from frame markers (name="frame", cat="frame")
+  {
+    std::vector<uint64_t> fts; fts.reserve(1024);
+    for (auto& e : in) {
+      if (e.ph==Phase::I && e.name[0] && std::strcmp(e.name,"frame")==0 &&
+          e.cat[0] && std::strcmp(e.cat,"frame")==0) {
+        fts.push_back(e.ts_us);
+      }
+    }
+    if (!fts.empty()) {
+      const uint64_t W = cfg.rate_window_us ? cfg.rate_window_us : 500000;
+      size_t j = 0;
+      for (size_t i = 0; i < fts.size(); ++i) {
+        uint64_t t = fts[i];
+        while (j < i && fts[j] + W < t) ++j;
+        size_t count = i - j + 1;
+        double fps = (double)count * 1000000.0 / (double)W;
+        emit_counter(t, "fps", "fps", fps, pid, 0, "synth");
+      }
+    }
+  }
+
+  // Counter rates: rate(<counter-name>)
+  {
+    struct Sample { uint64_t ts; double v; };
+    // map: name -> vector<Sample> (first arg only)
+    std::map<std::string, std::vector<Sample>> series;
+    series.clear();
+    for (auto& e : in) {
+      if (e.ph != Phase::C || e.argc == 0) continue;
+      if (e.args[0].kind != ArgKind::Number) continue;
+      series[e.name].push_back({e.ts_us, e.args[0].num});
+    }
+    for (auto& kv : series) {
+      auto& v = kv.second;
+      if (v.size() < 2) continue;
+      std::sort(v.begin(), v.end(), [](auto& a, auto& b){ return a.ts < b.ts; });
+      for (size_t i=1;i<v.size();++i) {
+        double dt = (double)(v[i].ts - v[i-1].ts) / 1e6;
+        if (dt <= 0) continue;
+        double rate = (v[i].v - v[i-1].v) / dt;   // units per second
+        char name[OTRACE_MAX_NAME];
+        std::snprintf(name, sizeof(name), "rate(%s)", kv.first.c_str());
+        emit_counter(v[i].ts, name, "value", rate, pid, 0, "synth");
+      }
+    }
+  }
+
+  // Scope latency percentiles: latency(<name>) instant at end-of-trace
+  {
+    std::map<std::string, std::vector<double>> lat;
+    for (auto& e : in) {
+      if (e.ph == Phase::X && e.name[0]) {
+        lat[e.name].push_back((double)e.dur_us); // us
+      }
+    }
+    for (auto& kv : lat) {
+      if (kv.second.empty()) continue;
+      auto v = kv.second;
+      std::sort(v.begin(), v.end());
+      char nm[OTRACE_MAX_NAME];
+      std::snprintf(nm, sizeof(nm), "latency(%s)", kv.first.c_str());
+      // ms for readability (displayTimeUnit is ms)
+      CleanEvent* inst = emit_instant(last_ts ? last_ts : 0, nm, pid, 0, "synth");
+      if (inst) {
+        for (uint32_t i=0; i<cfg.pct_count && inst->argc < OTRACE_MAX_ARGS; ++i) {
+          double q = cfg.pct_vals[i];
+          size_t idx = (size_t)std::floor(q * (v.size()-1));
+          double us = v[idx];
+          double ms = us / 1000.0;
+          Arg& a = inst->args[inst->argc++];
+          std::snprintf(a.key, sizeof(a.key), "%s", cfg.pct_names[i]);
+          a.kind = ArgKind::Number; a.num = ms;
+        }
+      }
+    }
+  }
+}
+#endif // OTRACE_SYNTHESIZE_TRACKS
+
+
+
+
+
+
 // --- rotation/gzip helpers -------------------------------------------------
 
 inline bool ends_with(const char* s, const char* suff) {
@@ -901,12 +1091,8 @@ inline bool compress_file_to_gzip(const char* in_path, const char* out_path, int
   if (std::fclose(fout) != 0) ok = false;
 
   if (!ok) {
-    // Best-effort cleanup
-#if defined(_WIN32)
-    _unlink(out_path);
-#else
-    unlink(out_path);
-#endif
+    std::remove(out_path);
+
   }
   return ok;
 }
@@ -992,40 +1178,29 @@ inline void write_rotated_trace(const std::vector<CleanEvent>& all) {
     wrote_ok = false;
 #endif
     // remove tmp either way
-#if defined(_WIN32)
-    _unlink(tmp_path);
-#else
-    unlink(tmp_path);
-#endif
-  } else {
-    // 3) No gzip: rename tmp -> final (overwrite)
-#if defined(_WIN32)
-    _unlink(adjusted_final); // ensure we can replace
-    wrote_ok = (0 == std::rename(tmp_path, adjusted_final));
-#else
-    // POSIX rename is atomic
-    wrote_ok = (0 == std::rename(tmp_path, adjusted_final));
-#endif
-    if (!wrote_ok) {
-      // fallback: copy+unlink
-      FILE* src = std::fopen(tmp_path, "rb");
-      FILE* dst = std::fopen(adjusted_final, "wb");
-      if (src && dst) {
-        char buf[256*1024];
-        size_t n;
-        while ((n = std::fread(buf, 1, sizeof(buf), src)) != 0) {
-          if (std::fwrite(buf, 1, n, dst) != n) { wrote_ok = false; break; }
-        }
-      } else wrote_ok = false;
-      if (src) std::fclose(src);
-      if (dst) std::fclose(dst);
-#if defined(_WIN32)
-      _unlink(tmp_path);
-#else
-      unlink(tmp_path);
-#endif
-    }
+std::remove(tmp_path);
+
+} else {
+  // 3) No gzip: rename tmp -> final (overwrite)
+  std::remove(adjusted_final); // ensure we can replace
+  wrote_ok = (0 == std::rename(tmp_path, adjusted_final));
+  if (!wrote_ok) {
+    // fallback: copy+remove
+    FILE* src = std::fopen(tmp_path, "rb");
+    FILE* dst = std::fopen(adjusted_final, "wb");
+    if (src && dst) {
+      char buf[256*1024];
+      size_t n;
+      while ((n = std::fread(buf, 1, sizeof(buf), src)) != 0) {
+        if (std::fwrite(buf, 1, n, dst) != n) { wrote_ok = false; break; }
+      }
+    } else wrote_ok = false;
+    if (src) std::fclose(src);
+    if (dst) std::fclose(dst);
+    std::remove(tmp_path);
   }
+}
+
 
   // 4) Bump index (wrap)
   R.rot_index = (R.rot_index + 1) % (R.max_files ? R.max_files : 1);
@@ -1044,7 +1219,7 @@ inline void flush_file(const char* path) {
   std::vector<CleanEvent> all; all.reserve(4096);
   collect_all(all);
 
-  // Sort for coherent timeline (ts, tid, seq if present)
+    // Sort for coherent timeline (ts, tid, seq if present)
   std::sort(all.begin(), all.end(), [](const CleanEvent& a, const CleanEvent& b){
     if (a.ts_us != b.ts_us) return a.ts_us < b.ts_us;
     if (a.tid   != b.tid)   return a.tid   < b.tid;
@@ -1054,6 +1229,25 @@ inline void flush_file(const char* path) {
     return (int)a.ph < (int)b.ph;
 #endif
   });
+
+#if OTRACE_SYNTHESIZE_TRACKS
+  if (reg().synth_enabled.load(std::memory_order_relaxed)) {
+    std::vector<CleanEvent> extra;
+    extra.reserve(1024);
+    synthesize_tracks(all, extra, reg().synth);
+    all.insert(all.end(), extra.begin(), extra.end());
+    std::stable_sort(all.begin(), all.end(), [](const CleanEvent& a, const CleanEvent& b){
+      if (a.ts_us != b.ts_us) return a.ts_us < b.ts_us;
+      if (a.tid   != b.tid)   return a.tid   < b.tid;
+#ifdef OTRACE_HAVE_CLEAN_SEQ
+      return a.seq < b.seq;
+#else
+      return (int)a.ph < (int)b.ph;
+#endif
+    });
+  }
+#endif
+
 
   // If rotation is configured, use it (ignores 'path')
   if (reg().pattern[0]) {
@@ -1182,6 +1376,8 @@ inline void otrace_set_sampling(double keep) {
 #define OTRACE_PP_CAT_I(a,b) a##b
 #endif
 
+
+
 #define OTRACE_ZONE(name)            OTRACE_SCOPE_C((name), "zone")
 
 // Begin/End
@@ -1191,14 +1387,18 @@ inline void otrace_set_sampling(double keep) {
 #define OTRACE_END_C(name, cat)      do{ OTRACE_TOUCH(); otrace::emit_end((name), (cat)); }while(0)
 
 // Instants
-#define OTRACE_INSTANT(name)         do{ OTRACE_TOUCH(); otrace::emit_instant((name), nullptr); }while(0)
-#define OTRACE_INSTANT_C(name, cat)  do{ OTRACE_TOUCH(); otrace::emit_instant((name), (cat)); }while(0)
-#define OTRACE_INSTANT_KV(name, key, val) do{ OTRACE_TOUCH(); otrace::emit_instant_kvs((name), nullptr, (key), (val)); }while(0)
-#define OTRACE_INSTANT_CKV(name, cat, ...) do{ OTRACE_TOUCH(); otrace::emit_instant_kvs((name), (cat), __VA_ARGS__); }while(0)
+#define OTRACE_INSTANT(name)             do{ OTRACE_TOUCH(); otrace::emit_instant((name), nullptr); }while(0)
+#define OTRACE_INSTANT_C(name, cat)      do{ OTRACE_TOUCH(); otrace::emit_instant((name), (cat)); }while(0)
+#define OTRACE_INSTANT_KV(name, ...)     do{ OTRACE_TOUCH(); otrace::emit_instant_kvs((name), nullptr, __VA_ARGS__); }while(0)
+#define OTRACE_INSTANT_CKV(name, cat, ...) \
+  do{ OTRACE_TOUCH(); otrace::emit_instant_kvs((name), (cat), __VA_ARGS__); }while(0)
 
+#define OTRACE_ENABLE_SYNTH_TRACKS(on) \
+  do{ OTRACE_TOUCH(); ::otrace::reg().synth_enabled.store(!!(on), std::memory_order_release); }while(0)
 
 // Frames
-#define OTRACE_MARK_FRAME(idx)       do{ OTRACE_TOUCH(); otrace::emit_instant_kv("frame", "frame", (double)(idx), "frame"); }while(0)
+#define OTRACE_MARK_FRAME(idx) \
+  do{ OTRACE_TOUCH(); otrace::emit_instant_kvs("frame", "frame", "frame", (double)(idx)); }while(0)
 #define OTRACE_MARK_FRAME_S(label)   do{ OTRACE_TOUCH(); otrace::Event* _e = otrace::get_tbuf()->append(); otrace::fill_common(*_e, otrace::Phase::I, "frame", "frame"); otrace::arg_string(*_e, "label", (label)); otrace::commit(_e); }while(0)
 
 // Counters
@@ -1236,6 +1436,8 @@ inline void otrace_set_sampling(double keep) {
 #define OTRACE_ENABLE_CATS(csv)      do{ OTRACE_TOUCH(); ::otrace::otrace_enable_cats((csv)); }while(0)
 #define OTRACE_DISABLE_CATS(csv)     do{ OTRACE_TOUCH(); ::otrace::otrace_disable_cats((csv)); }while(0)
 #define OTRACE_SET_SAMPLING(p)       do{ OTRACE_TOUCH(); ::otrace::otrace_set_sampling((p)); }while(0)
+
+
 
 // ---- Optional short aliases (default ON unless OTRACE_NO_SHORT_MACROS) ----
 #if !OTRACE_NO_SHORT_MACROS
@@ -1322,6 +1524,8 @@ inline void otrace_set_sampling(double keep) {
 
 #define OTRACE_FLUSH(...)                         ((void)0)
 #define OTRACE_SET_OUTPUT_PATH(...)               ((void)0)
+#define OTRACE_ENABLE_SYNTH_TRACKS(...)         ((void)0)
+
 
 // Keep call-by-name macros so code compiles as no-ops when disabled
 #define OTRACE_CALL(name, ...) OTRACE_##name(__VA_ARGS__)
@@ -1361,6 +1565,7 @@ inline void otrace_set_sampling(double keep) {
   #define TRACE_FLOW_END(...)                    OTRACE_FLOW_END(__VA_ARGS__)
   #define TRACE_FLUSH(...)                       OTRACE_FLUSH(__VA_ARGS__)
   #define TRACE_SET_OUTPUT_PATH(...)             OTRACE_SET_OUTPUT_PATH(__VA_ARGS__)
+  #define TRACE_ENABLE_SYNTH_TRACKS(...)        OTRACE_ENABLE_SYNTH_TRACKS(__VA_ARGS__)
 #endif
 
 #endif // OTRACE
