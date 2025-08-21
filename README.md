@@ -106,11 +106,12 @@ TRACE_END("upload");
 ```
 Most of the time, the RAII `TRACE_SCOPE*` is simpler and safer; reach for begin/end when you truly need to separate boundaries.
 
-**Instants** are zero-duration markers. They show up as thin vertical pins in the timeline. They are perfect for “we hit this branch,” “we just swapped buffers,” or “tick” style annotations.
+**Instants** are zero-duration markers. They show up as thin vertical pins in the timeline. They are perfect for “we hit this branch,” “we just swapped buffers,” or “tick” style annotations. As of 0.2.0 you can attach several key/values at once, and values may be numbers or short strings, so a single instant can carry all the detail you care about without emitting a cluster of adjacent events
 ```cpp
 TRACE_INSTANT("tick");
 TRACE_INSTANT_C("tick", "frame");
-TRACE_INSTANT_CKV("gc", "runtime", "major", 1); // name, category, key, value
+TRACE_INSTANT_KV("gc_note", "text", "minor");                      // single string
+TRACE_INSTANT_CKV("gc", "runtime", "major", 1, "bytes", 524288);   // multiple KVs
 ```
 **Counters** are values over time. They render as line charts under the timeline so you can correlate trends against phases above, queue sizes draining, memory climbing, FPS oscillating. You can emit a single series or a small group under the same name.
 ```cpp
