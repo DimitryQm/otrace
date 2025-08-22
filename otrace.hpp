@@ -97,6 +97,13 @@
  *   OTRACE_HEAP_SET_SAMPLING(0.2);                   // adjust callsite sampling (0..1)
  *   OTRACE_HEAP_REPORT();                            // emit heap_report_stats/leaks/sites
  *
+ *   // Global on/off at runtime
+ *   TRACE_ENABLE();                               // start recording (alias of OTRACE_ENABLE)
+ *   TRACE_DISABLE();                              // stop recording (alias of OTRACE_DISABLE)
+ *
+ *   // Convenience: scope tagged as category "zone"
+ *   TRACE_ZONE("hot_section");                    // same as TRACE_SCOPE_C("hot_section","zone")
+ *
  * Notes:
  *   • If the rotation pattern ends with ".gz", gzip is used only when built with
  *     OTRACE_USE_ZLIB=1 or OTRACE_USE_MINIZ=1; otherwise a plain JSON file is written.
