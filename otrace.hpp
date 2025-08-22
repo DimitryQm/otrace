@@ -8,7 +8,7 @@
 #ifndef OTRACE_HPP_INCLUDED
 #define OTRACE_HPP_INCLUDED
 /*
- * otrace.hpp — header-only timeline tracer
+ * otrace.hpp - header-only timeline tracer
  * version: 0.2.0
  *
  * About:
