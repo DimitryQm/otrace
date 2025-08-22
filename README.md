@@ -90,9 +90,9 @@ Platform notes
 
 
 Feature flags required by specific examples:
-heap_tracing_report.cpp  → -DOTRACE_HEAP=1 -DOTRACE_HEAP_STACKS=1 -DOTRACE_DEFINE_HEAP_HOOKS=1 [-rdynamic]
-synth_tracks.cpp         → -DOTRACE_SYNTHESIZE_TRACKS=1
-rotation_gzip.cpp        → -DOTRACE_USE_ZLIB=1   (or -DOTRACE_USE_MINIZ=1) for .json.gz output
+`heap_tracing_report.cpp  → -DOTRACE_HEAP=1 -DOTRACE_HEAP_STACKS=1 -DOTRACE_DEFINE_HEAP_HOOKS=1 [-rdynamic]`
+`synth_tracks.cpp         → -DOTRACE_SYNTHESIZE_TRACKS=1`
+`rotation_gzip.cpp        → -DOTRACE_USE_ZLIB=1   (or -DOTRACE_USE_MINIZ=1) for .json.gz output`
 
 
 ## What you can emit (and how it appears)
