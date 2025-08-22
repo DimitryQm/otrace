@@ -76,7 +76,7 @@ FROM slice s LEFT JOIN args a USING(arg_set_id)
 WHERE s.name IN ('heap_report_stats','heap_leaks','heap_sites')
 ORDER BY s.name, a.key;
 ```
-<p align="center"> <img src="docs/images/heap-tracingSQLQuery.png" alt="Perfetto “Query (SQL)” tab showing rows for heap_report_stats, heap_leaks, heap_sites" title="Perfetto Query(SQL)"> </p>
+<p align="center"> <img src="../docs/images/heap-tracingSQLQuery.png" alt="Perfetto “Query (SQL)” tab showing rows for heap_report_stats, heap_leaks, heap_sites" title="Perfetto Query(SQL)"> </p>
 
 ## Reading the output
 
