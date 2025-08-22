@@ -90,8 +90,11 @@ Platform notes
 
 
 Feature flags required by specific examples:
+
 `heap_tracing_report.cpp  → -DOTRACE_HEAP=1 -DOTRACE_HEAP_STACKS=1 -DOTRACE_DEFINE_HEAP_HOOKS=1 [-rdynamic]`
+
 `synth_tracks.cpp         → -DOTRACE_SYNTHESIZE_TRACKS=1`
+
 `rotation_gzip.cpp        → -DOTRACE_USE_ZLIB=1   (or -DOTRACE_USE_MINIZ=1) for .json.gz output`
 
 
@@ -456,7 +459,6 @@ c++ -std=c++17 -O2 -DOTRACE=1 -DOTRACE_CLOCK=2 -DOTRACE_THREAD_BUFFER_EVENTS=819
 This is a pared-down producer/consumer that exercises scopes, counters, flows, frames, and metadata. It’s short enough to read in one sitting, but rich enough to produce all the tracks shown in the screenshots.
 ```cpp
 // demo.cpp
-#define OTRACE 1
 #include "otrace.hpp"
 
 #include <thread>
