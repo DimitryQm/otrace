@@ -10,6 +10,8 @@
 - [Thread-safety model](#thread-safety-model)
 - [Disabling at runtime (and what it actually does)](#disabling-at-runtime-and-what-it-actually-does)
 - [Memory cost and sizing](#memory-cost-and-sizing)
+- [Heap tracing & leak report](#heap-tracing--leak-report-one-file-snapshot)
+- [Synthetic tracks at flush](#synthetic-tracks-at-flush)
 - [Compile-time configuration (definitions you can set)](#compile-time-configuration-definitions-you-can-set)
 - [A mid-sized example (end-to-end, but not a wall of code)](#a-mid-sized-example-end-to-end-but-not-a-wall-of-code)
 - [FAQ](#faq)
@@ -73,6 +75,25 @@ otrace requires **C++17+** and works on Windows/Linux/macOS so you can build it 
     
     `cl /std:c++17 /O2 /EHsc /DOTRACE=1 main.cpp`
 Run the program; you’ll find a `trace.json` in the current directory (or whatever path you set). Drag and drop that file into **Perfetto UI** at https://ui.perfetto.dev or open chrome://tracing in Chrome and use the “Load” button. You’ll see your process and threads on the left, and on the right a time axis with colored slices for scopes, vertical pins for instants, graphs for counters, and optional arrows for flows.
+There’s a focused example for every feature in [/examples](/examples).  
+Build one like this:
+
+```sh
+# clang / gcc
+c++ -std=c++17 -O2 -pthread -DOTRACE=1 examples/basics_scopes_instants.cpp -o ex_basics
+```
+
+Platform notes
+
+- Linux / macOS (clang or gcc): add `-pthread` when using threads; add `-rdynamic` for nicer backtraces in heap reports.
+- MSVC: `cl /std:c++17 /EHsc /O2 /DOTRACE=1 …`  (add `/Zc:__cplusplus` if the toolchain misreports the language level).
+
+
+Feature flags required by specific examples:
+heap_tracing_report.cpp  → -DOTRACE_HEAP=1 -DOTRACE_HEAP_STACKS=1 -DOTRACE_DEFINE_HEAP_HOOKS=1 [-rdynamic]
+synth_tracks.cpp         → -DOTRACE_SYNTHESIZE_TRACKS=1
+rotation_gzip.cpp        → -DOTRACE_USE_ZLIB=1   (or -DOTRACE_USE_MINIZ=1) for .json.gz output
+
 
 ## What you can emit (and how it appears)
 
@@ -97,6 +118,11 @@ The goal is that the timeline tells a story without needing a log window. The pr
 
 ```
 In the viewer, each becomes a colored slice on the thread’s lane, with the name and category available on hover, and with the extra argument visible in the details. The width of the slice is its measured duration.
+
+```cpp
+// sugar: a scope tagged with category "zone"
+TRACE_ZONE("hot_path");    // same as TRACE_SCOPE_C("hot_path","zone")
+```
 
 **Begin/End pairs** let you mark a long-lived operation when RAII isn’t convenient. They produce two separate events that the viewer stitches into a block.
 ```cpp
@@ -147,6 +173,42 @@ If you want a specific event to stand out, hint a color for the **next** emissio
 TRACE_COLOR("good");          // the *next* event will carry cname:"good"
 TRACE_SCOPE("hot_path");      // only this event gets the hint
 ```
+#### Heap tracing & leak report (one-file snapshot)
+**See**: [docs/features/heap-tracing.md](docs/features/heap-tracing.md)
+```cpp
+// build once: -DOTRACE=1 -DOTRACE_HEAP=1 -DOTRACE_HEAP_STACKS=1 -DOTRACE_DEFINE_HEAP_HOOKS=1 [-rdynamic on Linux]
+TRACE_SET_OUTPUT_PATH("heap_demo.json");
+TRACE_INSTANT("program_start");          // prevents empty file if you misconfigure
+
+OTRACE_HEAP_SET_SAMPLING(1.0);          // capture stacks for all sites in this window
+OTRACE_HEAP_ENABLE(true);
+
+// do allocations (leak a couple on purpose)
+(void)new char[1024];
+(void)new char[2048];
+
+OTRACE_HEAP_SET_SAMPLING(0.0);          // keep heap enabled; avoid reentrancy during report
+OTRACE_HEAP_REPORT();                   // emits heap_report_stats / heap_sites / heap_leaks
+TRACE_FLUSH(nullptr);
+```
+Open the file in perfetto and search for “heap”; you’ll see a counter `heap_live_bytes` plus three instants with table-shaped args.
+If your program does heavy work during global destruction, disable the hooks before global
+dtors run to avoid late allocations while reporting:
+
+```cpp
+OTRACE_HEAP_ENABLE(false);
+TRACE_DISABLE();
+```
+## Synthetic tracks at flush
+```cpp
+// compile with -DOTRACE_SYNTHESIZE_TRACKS=1 then toggle at runtime:
+OTRACE_ENABLE_SYNTH_TRACKS(true);
+
+// …emit frames / counters / scopes…
+TRACE_FLUSH(nullptr); // appends fps, rate(counter), and latency percentiles
+```
+See [docs/features/synthetic-tracks.md](docs/features/synthetic-tracks.md) for details (window, percentile labels, output shapes).
+
 ## How timestamps work (and what to choose)
 
 Every timestamp in `trace.json` is **microseconds since first use** within your process. The source can be chosen at build time:
@@ -165,6 +227,16 @@ If you compile with `OTRACE_CLOCK=2` on a non-x86 target, the header silently fa
 Each thread that touches the API gets a per-thread ring buffer with a fixed number of events (the default is `32768` per thread and can be tuned with `-DOTRACE_THREAD_BUFFER_EVENTS=<N>`). Appending an event reserves a slot, fills in the fields, and finally marks it committed with a single atomic store. The thread never locks. If the ring wraps, the oldest entries on that thread are overwritten.
 
 When you call `TRACE_FLUSH(path)` (or when the process exits, because the default `-DOTRACE_ON_EXIT=1` arranges an atexit handler), the library briefly stops accepting new appends, copies committed events out of each thread’s buffer, adds metadata, sorts the events by time (with a stable tiebreaker), and writes them as a single JSON object with a `"traceEvents"` array. If the file cannot be opened, it restores the previous state and returns without aborting your program. You can change the default path at runtime via `TRACE_SET_OUTPUT_PATH("runs/trace.json")`.
+```cpp
+// rotating files (advisory size in MB; keeps the last N files)
+TRACE_SET_OUTPUT_PATTERN("traces/run-%03u.json", 8, 6);
+for (int i = 0; i < 2000; ++i) TRACE_INSTANT_CKV("emit","io","i",i);
+TRACE_FLUSH(nullptr);
+
+// gzip if built with -DOTRACE_USE_ZLIB=1 or -DOTRACE_USE_MINIZ=1; otherwise falls back to plain .json
+TRACE_SET_OUTPUT_PATTERN("traces/run-%03u.json.gz", 8, 6);
+```
+Rotation writes the report into **whichever file you flush last**. If you rely on `OTRACE_HEAP_REPORT()` or synth tracks, call them before the final `TRACE_FLUSH` you plan to open.
 
 ## Building and toggling features
 
@@ -179,16 +251,19 @@ The header is designed to be self-contained and friendly to typical build setups
 - `OTRACE_ON_EXIT` controls whether a flush happens at process exit; it is `1` by default.
     
 - `OTRACE_CLOCK` chooses the timebase as described above.
-    
-
+  
 At runtime you can also toggle collection:
 ```cpp
-TRACE_DISABLE();                 // temporarily stop collecting
-// do something noisy
-TRACE_ENABLE();                  // resume
-if (TRACE_IS_ENABLED()) { /* ... */ }
+// global runtime gate
+TRACE_DISABLE();                 // hot path early-outs; no state is torn down
+// ... noisy warmup ...
+TRACE_ENABLE();                  // resume recording
+if (TRACE_IS_ENABLED()) { /* … */ }
+
+// one-shot init that also reads env (OTRACE_ENABLE / OTRACE_DISABLE / OTRACE_SAMPLE)
+OTRACE_TOUCH();
 ```
-This can be valuable in long-running services where you only want a window of detail.
+Environment variables are read **once** on first use. `OTRACE_ENABLE=1` wins over `OTRACE_DISABLE=1`. `OTRACE_SAMPLE` controls the probability gate used by `OTRACE_SET_SAMPLING` when you haven’t touched it at runtime.
 
 ## Examples on the timeline (with screenshots)
 
@@ -480,8 +555,6 @@ Open `trace.json` in **Perfetto UI**. You should see:
     
 - **Frame markers** (“frame” instants) you can search for by name.
     
-
-This is essentially the example that produced the three screenshots in the README.
 
 ## FAQ
 
