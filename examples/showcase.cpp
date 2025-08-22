@@ -1,4 +1,3 @@
-#define OTRACE 1
 #include "otrace.hpp"
 
 #include <thread>
