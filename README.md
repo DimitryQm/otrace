@@ -30,7 +30,7 @@ This isn’t a sampling profiler or a system-wide tracer. It is deliberate, in-p
 Add the header to your project. Build your program with C++17 or later and define `OTRACE=1` to enable instrumentation. When `OTRACE` is left at the default `0`, every macro compiles out to a no-op, so there’s no overhead in production by default. Add `-pthread` on Linux when using threads (it’s accepted and harmless on macOS/Clang).
 ```cpp
 // main.cpp
-#define OTRACE 1
+// #define OTRACE 1 you can omit this if you're gonna add it to your build command
 #include "otrace.hpp"
 
 #include <thread>
