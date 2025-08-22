@@ -1,16 +1,21 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2025 DimitryQm
+ * This file is part of otrace (v0.2.0). The full MIT license text is in the project’s LICENSE file:
+ * https://github.com/DimitryQm/otrace/blob/main/LICENSE
+ */
+
+
 #ifndef OTRACE_HPP_INCLUDED
 #define OTRACE_HPP_INCLUDED
-/**
- * @file    otrace.hpp
- * @brief   Header-only in-process timeline instrumentation for Perfetto / Chrome Trace Event JSON.
- * @author  DimitryQm
- * @version 0.2.0
- * @date    2025-08-21
- * @license MIT
- * @see     https://ui.perfetto.dev/ , chrome://tracing
+/*
+ * otrace.hpp — header-only timeline tracer
+ * version: 0.2.0
  *
- * otrace — drop-in annotations for scopes, instants, counters, flows, and frames.
- * Single header, zero deps, microsecond timestamps, per-thread lock-free rings, safe flush.
+ * About:
+ *   Annotate C++ with scopes, instants, counters, flows, and frames, then open the
+ *   resulting Chrome Trace JSON in Perfetto or chrome://tracing. You control exactly
+ *   what’s recorded; nothing is sampled implicitly. Per-thread lock-free rings buffer
+ *   events; a synchronous flush writes a compact .json (or .json.gz).
  *
  * Build flags (define at compile time):
  *   -DOTRACE=1                         Enable tracing (default 0 = disabled)
@@ -22,44 +27,57 @@
  *   -DOTRACE_NO_SHORT_MACROS=1         Hide TRACE_* aliases; use OTRACE_* only (default 0)
  *   -DOTRACE_USE_ZLIB=1                Enable gzip for *.json.gz (zlib present)
  *   -DOTRACE_USE_MINIZ=1               Enable gzip via bundled miniz (if you ship it)
- *   -DOTRACE_SYNTHESIZE_TRACKS=1      Enable synthetic tracks at flush (default 0)
- *   -DOTRACE_SYNTH_RATE_WINDOW_US=... Rolling window for FPS/rates (default 500000)
- *   -DOTRACE_SYNTH_PCT_NAMES="..."    Percentiles for scope latency summary (default "p50,p95,p99")
-
+ *   -DOTRACE_SYNTHESIZE_TRACKS=1       Enable synthetic tracks at flush (default 0)
+ *   -DOTRACE_SYNTH_RATE_WINDOW_US=...  Rolling window for FPS/rates (default 500000)
+ *   -DOTRACE_SYNTH_PCT_NAMES="..."     Percentiles for latency summary (default "p50,p95,p99")
+ *
+ *   // Heap tracer (optional, header-only; off by default)
+ *   -DOTRACE_HEAP=1                    Enable heap tracing layer
+ *   -DOTRACE_DEFINE_HEAP_HOOKS=1       Define global new/delete wrappers (ONE TU only)
+ *   -DOTRACE_HEAP_SAMPLE=0.10          Initial callsite sampling probability (default 0.0)
+ *   -DOTRACE_HEAP_STACKS=1             Capture short stacks for sampled sites (default 0)
+ *   -DOTRACE_HEAP_STACK_DEPTH=8        Max frames per captured stack (default 8)
+ *   -DOTRACE_HEAP_SHARDS=64            Shard count for live allocation map (default 64)
+ *   -DOTRACE_HEAP_DEMANGLE=1           Demangle C++ symbols in reports if available (default 0)
+ *   -DOTRACE_HEAP_DBGHELP=1            Use DbgHelp on Windows when present (default 0)
+ *
  * Environment variables (read once on first use):
  *   OTRACE_DISABLE=1                   Disable recording
  *   OTRACE_ENABLE=1                    Enable recording (wins over DISABLE)
  *   OTRACE_SAMPLE=0.10                 Keep probability for sampling (0..1)
  *
  * Public API (when OTRACE==1) — examples:
+ *   // Bring the recorder up / query state
+ *   OTRACE_TOUCH();                                   // force lazy init (reads env)
+ *   bool on = TRACE_IS_ENABLED();                     // fast “is enabled?” check
+ *
  *   // Scopes & events
- *   TRACE_SCOPE("step");                              // or OTRACE_SCOPE
+ *   TRACE_SCOPE("step");                              // or OTRACE_SCOPE(...)
  *   TRACE_BEGIN("upload"); TRACE_END("upload");
  *
- *   // Instants with key/values(0.2.0+):
- *   // • Values can be numbers or strings
- *   // • You may pass multiple KVs in a single call (variadic)
- *   // • Bounded by OTRACE_MAX_ARGS per event
+ *   // Instants with key/values (0.2.0+):
+ *   // • Values: numbers or strings
+ *   // • Multiple KVs per call (variadic), capped by OTRACE_MAX_ARGS
  *   TRACE_INSTANT_KV ("speed", "mps", 12.5);
  *   TRACE_INSTANT_KV ("note",  "text", "hello world");
- *   TRACE_INSTANT_CKV("tick", "frame", "phase", 42, "stage", "copy");
+ *   TRACE_INSTANT_CKV("tick",  "frame", "phase", 42, "stage", "copy");
  *
  *   // Counters, flows, frames
  *   TRACE_COUNTER("queue_len", n);
  *   TRACE_FLOW_BEGIN(id); TRACE_FLOW_STEP(id); TRACE_FLOW_END(id);
  *   TRACE_MARK_FRAME(i); TRACE_MARK_FRAME_S("present");
  *
- *   // Metadata, colors
+ *   // Metadata & colors
  *   TRACE_SET_THREAD_NAME("worker-0"); TRACE_SET_PROCESS_NAME("my-app");
  *   TRACE_SET_THREAD_SORT_INDEX(10);
- *   TRACE_COLOR("good");
+ *   TRACE_COLOR("good");                                 // affects next event only
  *
  *   // Output control: single file or rotation (+optional gzip)
  *   TRACE_SET_OUTPUT_PATH("trace.json");
- *   TRACE_SET_OUTPUT_PATTERN("traces/run-%04u.json.gz", 64, 10)  // max_size_mb=64, max_files=10
+ *   TRACE_SET_OUTPUT_PATTERN("traces/run-%04u.json.gz", 64 MB, 10); // max_size_mb, max_files
  *   TRACE_FLUSH(nullptr);
  *
- *   // Filters & sampling
+ *   // Filters & sampling (runtime gates)
  *   OTRACE_SET_FILTER(+[](const char* name, const char* cat){ return cat && std::strcmp(cat,"io")==0; });
  *   OTRACE_ENABLE_CATS("io,frame");                  // allowlist categories
  *   OTRACE_DISABLE_CATS("debug,noise");              // denylist categories
@@ -70,20 +88,24 @@
  *   OTRACE_CALL(COUNTER, "queue_len", v);            // expands to OTRACE_COUNTER(...)
  *   // or with aliases (enabled by default):
  *   TRACE(COUNTER, "queue_len", v);
- 
- *   // Synthesis (if compiled in)
- *   OTRACE_ENABLE_SYNTH_TRACKS(true);  // optional runtime toggle
-
+ *
+ *   // Flush-time synthesis (if compiled in)
+ *   OTRACE_ENABLE_SYNTH_TRACKS(true);                // runtime toggle for synthetic tracks
+ *
+ *   // Heap tracer controls & report (if compiled with OTRACE_HEAP)
+ *   OTRACE_HEAP_ENABLE(true);                        // arm/disarm heap capture at runtime
+ *   OTRACE_HEAP_SET_SAMPLING(0.2);                   // adjust callsite sampling (0..1)
+ *   OTRACE_HEAP_REPORT();                            // emit heap_report_stats/leaks/sites
  *
  * Notes:
- *   • If the pattern ends with ".gz", gzip is used only when built with OTRACE_USE_ZLIB=1 or OTRACE_USE_MINIZ=1;
- *     otherwise a plain JSON file is written.
+ *   • If the rotation pattern ends with ".gz", gzip is used only when built with
+ *     OTRACE_USE_ZLIB=1 or OTRACE_USE_MINIZ=1; otherwise a plain JSON file is written.
  *   • TRACE_* aliases are enabled by default; define OTRACE_NO_SHORT_MACROS=1 to hide them.
- *   • Env vars are read once on first use of the API in-process.
+ *   • Env vars are read once on first touch in-process (see OTRACE_TOUCH()).
  *   • Each key/value added to an event counts toward OTRACE_MAX_ARGS for that event.
+ *   • Define OTRACE_DEFINE_HEAP_HOOKS in exactly one translation unit when using the heap hooks.
  *
  * Requirements: C++17+, Windows/Linux/macOS. Not async-signal-safe.
- * SPDX-License-Identifier: MIT
  */
 
 
@@ -136,6 +158,35 @@
 #define OTRACE_SYNTH_PCT_NAMES "p50,p95,p99"
 #endif
 
+#ifndef OTRACE_HEAP
+#define OTRACE_HEAP 0
+#endif
+
+#ifndef OTRACE_DEFINE_HEAP_HOOKS
+#define OTRACE_DEFINE_HEAP_HOOKS 0
+#endif
+
+#ifndef OTRACE_HEAP_SAMPLE
+#define OTRACE_HEAP_SAMPLE 0.0
+#endif
+
+#ifndef OTRACE_HEAP_STACK_DEPTH
+#define OTRACE_HEAP_STACK_DEPTH 8
+#endif
+
+#ifndef OTRACE_HEAP_SHARDS
+#define OTRACE_HEAP_SHARDS 64
+#endif
+
+#ifndef OTRACE_HEAP_STACKS
+#define OTRACE_HEAP_STACKS 0
+#endif
+#ifndef OTRACE_HEAP_DEMANGLE
+#define OTRACE_HEAP_DEMANGLE 0
+#endif
+#ifndef OTRACE_HEAP_DBGHELP
+#define OTRACE_HEAP_DBGHELP 0
+#endif
 
 
 // Public Macros (no-ops when OTRACE == 0)
@@ -149,6 +200,7 @@
 #include <cstring>
 #include <thread>
 #include <chrono>
+#include <new>
 #include <vector>
 #include <algorithm>
 #include <string>
@@ -156,6 +208,9 @@
 #include <type_traits>
 #include <map>
 #include <cmath>
+#include <unordered_map>
+#include <mutex>
+
 
 
 #if __cplusplus >= 201703L
@@ -167,6 +222,7 @@
   #include <windows.h>
   #include <processthreadsapi.h>
   #include <sys/stat.h>
+  #include <direct.h>
 #elif defined(__APPLE__)
   #include <pthread.h>
   #include <sys/types.h>
@@ -179,6 +235,7 @@
   #include <sys/stat.h>  
 #endif
 
+#include <cerrno>
 #if OTRACE_CLOCK==2 && (defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64))
   #if defined(_MSC_VER)
     #include <intrin.h>
@@ -195,6 +252,42 @@
   #include "miniz.h"
 #endif
 
+#ifndef __has_include
+  #define __has_include(x) 0
+#endif
+
+// ================= Optional: stack capture (heap tracer) =============
+// Only include when BOTH heap tracer and stack capture are enabled.
+#if OTRACE_HEAP && OTRACE_HEAP_STACKS
+  #if defined(_WIN32)
+    // DbgHelp is optional; do NOT force-link from a header.
+    #if OTRACE_HEAP_DBGHELP && __has_include(<dbghelp.h>)
+      #include <dbghelp.h>
+      #define OTRACE_HAVE_DBGHELP 1
+    #else
+      #define OTRACE_HAVE_DBGHELP 0
+    #endif
+  #else
+    #if __has_include(<execinfo.h>)
+      #include <execinfo.h>        // backtrace(), backtrace_symbols()
+      #define OTRACE_HAVE_EXECINFO 1
+    #else
+      #define OTRACE_HAVE_EXECINFO 0
+    #endif
+  #endif
+#else
+  #define OTRACE_HAVE_DBGHELP   0
+  #define OTRACE_HAVE_EXECINFO  0
+#endif
+
+// ================= Optional: demangling (heap tracer) ================
+#if OTRACE_HEAP && OTRACE_HEAP_DEMANGLE && __has_include(<cxxabi.h>)
+  #include <cxxabi.h>            // abi::__cxa_demangle
+  #define OTRACE_HAVE_CXXABI 1
+#else
+  #define OTRACE_HAVE_CXXABI 0
+#endif
+
 
 
 namespace otrace {
@@ -203,11 +296,24 @@ namespace otrace {
 #if OTRACE_CLOCK==2 && (defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64))
   static inline uint64_t rdtsc() noexcept { return __rdtsc(); }
 #endif
-
+inline thread_local bool tls_in_tracer = false;
+struct TracerGuard { bool active=false; TracerGuard(){ if(!tls_in_tracer){ tls_in_tracer=true; active=true; } } ~TracerGuard(){ if(active) tls_in_tracer=false; } };
+    
 inline bool csv_has(const char* csv, const char* key);                   // forward
 inline bool should_emit(const char* name, const char* cat);              // forward
 struct AtExitHook;                   // forward
 inline AtExitHook& hook();           // forward
+inline uint64_t now_us();  // forward so heap code can call it
+// 1-pair overload forward decl (works for generate_report)
+inline void emit_instant_kvs(const char* name, const char* cat,
+                             const char* key, const char* value);
+// keeping a correct forward decl of the template too, but it won’t be needed by generate_report:
+template <typename... KVs>
+inline void emit_instant_kvs(const char* name, const char* cat, KVs&&... kvs);
+
+inline void emit_counter_n(const char* name, const char* cat, int n,
+                           const char** keys, const double* vals);
+
 inline uint32_t pid() {
 #if defined(_WIN32)
   return static_cast<uint32_t>(::GetCurrentProcessId());
@@ -230,6 +336,49 @@ inline uint32_t tid() {
 #endif
 }
 
+
+
+// Create parent directories for a target path.
+inline void mkpath(const char* path) {
+  if (!path || !*path) return;
+
+#if defined(_WIN32)
+  // Normalize slashes and skip drive/UNC roots.
+  char tmp[1024];
+  std::snprintf(tmp, sizeof(tmp), "%s", path);
+  for (char* q = tmp; *q; ++q) if (*q == '/') *q = '\\';
+
+  char* p = tmp;
+  // "C:\"
+  if (((p[0]|32) >= 'a' && (p[0]|32) <= 'z') && p[1]==':' && p[2]=='\\') {
+    p += 3;
+  }
+  // "\\server\share\"
+  else if (p[0]=='\\' && p[1]=='\\') {
+    p += 2; while (*p && *p!='\\') ++p; if (*p=='\\') ++p; // server
+    while (*p && *p!='\\') ++p; if (*p=='\\') ++p;         // share
+  }
+
+  for (; *p; ++p) {
+    if (*p == '\\') { char c = *p; *p = 0; _mkdir(tmp); *p = c; }
+  }
+#else
+  // POSIX: progressively mkdir() on each '/' boundary.
+  char tmp[1024];
+  std::snprintf(tmp, sizeof(tmp), "%s", path);
+  for (char* p = tmp + 1; *p; ++p) {
+    if (*p == '/') {
+      char c = *p; *p = 0;
+      if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+        // ignore; best-effort (race/perms/etc.)
+      }
+      *p = c;
+    }
+  }
+#endif
+}
+
+    
 // ---- Timestamp source -----------------------------------------------------
 struct Timebase {
   // Ensure build-time correctness.
@@ -311,6 +460,364 @@ struct Timebase {
 #endif
   }
 };
+    
+
+#if OTRACE_HEAP
+
+namespace heap {
+
+// Allocation entry
+struct AllocEntry {
+    size_t size;
+    uint64_t stack_hash;
+    uint64_t timestamp;
+};
+
+// Callsite statistics
+struct CallsiteStats {
+    uint64_t total_bytes;
+    uint64_t alloc_count;
+    uint64_t live_bytes;
+    uint64_t live_count;
+    std::string sample_stack;
+};
+
+// Shard for lock reduction
+struct Shard {
+    std::unordered_map<void*, AllocEntry> allocations;
+    std::mutex mutex;
+};
+
+// Global state
+struct State {
+    std::atomic<uint64_t> live_bytes{0};
+    std::atomic<uint64_t> total_allocations{0};
+    std::atomic<uint64_t> total_frees{0};
+    std::atomic<bool> enabled{false};
+    std::atomic<double> sample_rate{OTRACE_HEAP_SAMPLE};
+    
+    Shard shards[OTRACE_HEAP_SHARDS];
+    std::unordered_map<uint64_t, CallsiteStats> callsites;
+    std::mutex callsites_mutex;
+    
+    std::atomic<uint64_t> last_counter_update{0};
+    uint64_t counter_update_interval{1000000}; // 1 second in microseconds
+};
+    
+
+inline State& state() {
+    static State s;
+    return s;
+}
+
+// Thread-local reentrancy guard for heap hooks
+inline thread_local bool tls_in_heap_hook = false;
+
+struct HeapHookGuard {
+  bool active = false;
+  HeapHookGuard() {
+    if (!tls_in_heap_hook) { tls_in_heap_hook = true; active = true; }
+  }
+  ~HeapHookGuard() {
+    if (active) tls_in_heap_hook = false;
+  }
+};
+
+inline uint64_t now_us() { return Timebase::now_us(); }
+// Hash a stack trace
+inline uint64_t hash_stack(void** stack, int depth) {
+    uint64_t hash = 0;
+    for (int i = 0; i < depth; ++i) {
+        hash ^= (uint64_t)stack[i];
+        hash = (hash << 13) | (hash >> 51);
+        hash *= 0x9E3779B97F4A7C15;
+    }
+    return hash;
+}
+
+inline int capture_stack(void** buffer, int max_depth) {
+#if OTRACE_HAVE_EXECINFO
+  return backtrace(buffer, max_depth);
+#elif defined(_WIN32) && OTRACE_HAVE_DBGHELP
+  return (int)CaptureStackBackTrace(0, (ULONG)max_depth, buffer, nullptr);
+#else
+  return 0;
+#endif
+}
+
+
+// Demangle symbol name
+inline std::string demangle(const char* name) {
+#if OTRACE_HAVE_CXXABI
+  int status = 0;
+  char* demangled = abi::__cxa_demangle(name, nullptr, nullptr, &status);
+  if (demangled) { std::string s(demangled); std::free(demangled); return s; }
+#endif
+  return name ? name : "unknown";
+}
+
+// Format stack frame
+inline std::string format_frame(const char* symbol) {
+    std::string frame(symbol);
+    // Extract function name from symbol
+    size_t start = frame.find('(');
+    size_t end = frame.find('+', start);
+    if (start != std::string::npos && end != std::string::npos) {
+        std::string func = frame.substr(start + 1, end - start - 1);
+        return demangle(func.c_str());
+    }
+    return frame;
+}
+
+// Format stack trace
+inline std::string format_stack(void** stack, int depth) {
+    std::string result;
+#if defined(__linux__) || defined(__APPLE__)
+    char** symbols = backtrace_symbols(stack, depth);
+    if (symbols) {
+        for (int i = 2; i < depth && symbols[i]; ++i) { // Skip first two frames (heap functions)
+            if (i > 2) result += " <- ";
+            result += format_frame(symbols[i]);
+        }
+        free(symbols);
+    }
+#endif
+    return result;
+}
+
+// Get shard for a pointer
+inline Shard& get_shard(void* ptr) {
+    uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+    return state().shards[p % OTRACE_HEAP_SHARDS];
+}
+
+// Record allocation
+inline void record_alloc(void* ptr, size_t size) {
+    if (!ptr) return;
+    if (otrace::tls_in_tracer) return;
+    HeapHookGuard guard;
+    if (!guard.active) return;  // already inside the hook: skip
+    if (!state().enabled.load(std::memory_order_relaxed)) return;
+    
+    // Update global stats
+    state().live_bytes.fetch_add(size, std::memory_order_relaxed);
+    state().total_allocations.fetch_add(1, std::memory_order_relaxed);
+    
+    // Sample stack if needed
+    uint64_t stack_hash = 0;
+    std::string stack_str;
+    double rate = state().sample_rate.load(std::memory_order_relaxed);
+    
+    if (rate > 0.0) {
+        // Tiny thread-local xorshift for sampling
+        thread_local uint64_t s = (uint64_t)otrace::tid() * 0x9E3779B97F4A7C15ull + now_us();
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        double u = (double)((s >> 11) & ((1ull<<53)-1)) / (double)(1ull<<53);
+        
+        if (u < rate) {
+            void* stack[OTRACE_HEAP_STACK_DEPTH];
+            int depth = capture_stack(stack, OTRACE_HEAP_STACK_DEPTH);
+            if (depth > 2) { // Skip heap functions
+                stack_hash = hash_stack(stack + 2, depth - 2);
+                stack_str = format_stack(stack + 2, depth - 2);
+            }
+        }
+    }
+    
+    // Store allocation
+    Shard& shard = get_shard(ptr);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    shard.allocations[ptr] = {size, stack_hash, now_us()};
+    
+    // Update callsite stats if we have a stack
+    if (stack_hash != 0) {
+        std::lock_guard<std::mutex> lock(state().callsites_mutex);
+        CallsiteStats& stats = state().callsites[stack_hash];
+        stats.total_bytes += size;
+        stats.alloc_count += 1;
+        stats.live_bytes += size;
+        stats.live_count += 1;
+        if (stats.sample_stack.empty() && !stack_str.empty()) {
+            stats.sample_stack = stack_str;
+        }
+    }
+    
+    // Periodically update counter
+uint64_t now = ::otrace::now_us();
+uint64_t last = state().last_counter_update.load(std::memory_order_relaxed);
+if (now - last >= state().counter_update_interval) {
+  if (state().last_counter_update.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+    const char* k[] = { "heap_live_bytes" };
+    double v[] = { (double)state().live_bytes.load(std::memory_order_relaxed) };
+    ::otrace::emit_counter_n("heap_live_bytes", nullptr, 1, k, v);
+  }
+}
+
+        }
+
+// Record free
+inline void record_free(void* ptr) {
+  if (!ptr) return;
+  if (otrace::tls_in_tracer) return;   
+  HeapHookGuard guard;
+  if (!guard.active) return;  // already inside the hook: skip
+  if (!state().enabled.load(std::memory_order_relaxed)) return;
+    Shard& shard = get_shard(ptr);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    auto it = shard.allocations.find(ptr);
+    if (it != shard.allocations.end()) {
+        // Update global stats
+        state().live_bytes.fetch_sub(it->second.size, std::memory_order_relaxed);
+        state().total_frees.fetch_add(1, std::memory_order_relaxed);
+        
+        // Update callsite stats if we have a stack
+        if (it->second.stack_hash != 0) {
+            std::lock_guard<std::mutex> lock(state().callsites_mutex);
+            auto cs_it = state().callsites.find(it->second.stack_hash);
+            if (cs_it != state().callsites.end()) {
+                cs_it->second.live_bytes -= it->second.size;
+                cs_it->second.live_count -= 1;
+            }
+        }
+        
+        // Remove allocation
+        shard.allocations.erase(it);
+    }
+}
+
+// Generate heap report
+inline void generate_report() {
+  if (!state().enabled.load(std::memory_order_relaxed)) return;
+
+  ::otrace::emit_instant_kvs("heap_report_started", "heap", "status", "begin");
+
+  // 1) Snapshot live allocations
+  std::vector<std::pair<void*, AllocEntry>> all_allocs;
+  all_allocs.reserve(1024);
+  for (int i = 0; i < OTRACE_HEAP_SHARDS; ++i) {
+    std::lock_guard<std::mutex> lk(state().shards[i].mutex);
+    all_allocs.insert(all_allocs.end(),
+                      state().shards[i].allocations.begin(),
+                      state().shards[i].allocations.end());
+  }
+
+  // 2) Group by callsite hash
+  std::unordered_map<uint64_t, std::vector<std::pair<void*, AllocEntry>>> by_site;
+  for (const auto& p : all_allocs) {
+    by_site[p.second.stack_hash].push_back(p);
+  }
+
+  // 3) Sort sites by total bytes
+  std::vector<std::pair<uint64_t, uint64_t>> leak_sizes;
+  leak_sizes.reserve(by_site.size());
+  for (const auto& kv : by_site) {
+    uint64_t total = 0;
+    for (const auto& alloc : kv.second) total += alloc.second.size;
+    leak_sizes.emplace_back(kv.first, total);
+  }
+  std::sort(leak_sizes.begin(), leak_sizes.end(),
+            [](const auto& a, const auto& b){ return a.second > b.second; });
+
+  // 4) Emit summary stats (always)
+  {
+    const std::string live_cnt = std::to_string(all_allocs.size());
+    const std::string sites_cnt = std::to_string(by_site.size());
+    ::otrace::emit_instant_kvs("heap_report_stats","heap",
+                               "live_alloc_count", live_cnt.c_str(),
+                               "site_count",       sites_cnt.c_str());
+  }
+
+  // 5) Emit top leaks — with fallback text if we don't have a callsite entry
+  {
+    std::lock_guard<std::mutex> lk(state().callsites_mutex);
+    const int N = std::min<int>(10, leak_sizes.size());
+    if (N == 0) {
+      ::otrace::emit_instant_kvs("heap_leaks","heap",
+                                 "info","no_live_allocations_detected");
+    } else {
+      for (int i = 0; i < N; ++i) {
+        const uint64_t hash = leak_sizes[i].first;
+        const uint64_t size = leak_sizes[i].second;
+
+        const auto it = state().callsites.find(hash);
+        const bool have_cs = (it != state().callsites.end());
+        const std::string& sample = have_cs ? it->second.sample_stack : std::string();
+
+        std::string key   = "leak_" + std::to_string(i+1);
+        std::string value;
+        if (have_cs && !sample.empty()) {
+          value = sample + " (" +
+                  std::to_string(size) + " bytes, " +
+                  std::to_string(by_site[hash].size()) + " allocations)";
+        } else {
+          // fallback when callsite info is missing
+          char buf[128];
+          std::snprintf(buf, sizeof(buf),
+                        "hash=0x%016llx (%llu bytes, %zu allocations)",
+                        (unsigned long long)hash,
+                        (unsigned long long)size,
+                        by_site[hash].size());
+          value = buf;
+        }
+        ::otrace::emit_instant_kvs("heap_leaks","heap", key.c_str(), value.c_str());
+      }
+    }
+  }
+
+  // 6) Emit top allocation sites by total bytes (or a fallback)
+  {
+    std::vector<std::pair<uint64_t, CallsiteStats>> sites(
+        state().callsites.begin(), state().callsites.end());
+    std::sort(sites.begin(), sites.end(),
+              [](const auto& a, const auto& b){
+                return a.second.total_bytes > b.second.total_bytes;
+              });
+
+    const int N = std::min<int>(10, sites.size());
+    if (N == 0) {
+      ::otrace::emit_instant_kvs("heap_sites","heap",
+                                 "info","no_callsite_info_available");
+    } else {
+      for (int i = 0; i < N; ++i) {
+        std::string key   = "site_" + std::to_string(i+1);
+        std::string value = sites[i].second.sample_stack + " (" +
+                            std::to_string(sites[i].second.total_bytes) + " bytes, " +
+                            std::to_string(sites[i].second.alloc_count) + " allocations)";
+        ::otrace::emit_instant_kvs("heap_sites","heap", key.c_str(), value.c_str());
+      }
+    }
+  }
+
+  ::otrace::emit_instant_kvs("heap_report_done", "heap", "status", "end");
+}
+
+
+// Public API
+inline void enable(bool on) {
+    state().enabled.store(on, std::memory_order_release);
+    if (on) {
+        state().live_bytes = 0;
+        state().total_allocations = 0;
+        state().total_frees = 0;
+        for (int i = 0; i < OTRACE_HEAP_SHARDS; ++i) {
+            std::lock_guard<std::mutex> lock(state().shards[i].mutex);
+            state().shards[i].allocations.clear();
+        }
+        std::lock_guard<std::mutex> lock(state().callsites_mutex);
+        state().callsites.clear();
+    }
+}
+
+inline void set_sampling(double rate) {
+    if (rate < 0.0) rate = 0.0;
+    if (rate > 1.0) rate = 1.0;
+    state().sample_rate.store(rate, std::memory_order_release);
+}
+
+} // namespace heap
+
+#endif // OTRACE_HEAP
+
 
 
 inline uint64_t now_us() { return Timebase::now_us(); }
@@ -395,6 +902,7 @@ struct ThreadBuffer {
   ~ThreadBuffer() { delete[] buf; }
 
 Event* append() {
+    otrace::TracerGuard _tg;  
     uint32_t idx = head++;
     total_appends++;
     if (head >= cap) { head = 0; wrapped = true; }
@@ -645,6 +1153,7 @@ inline void fill_common(Event& e, Phase ph, const char* name, const char* cat) {
 }
 
 inline void commit(Event* ev) {
+  otrace::TracerGuard _tg;  
   ev->committed.store(1, std::memory_order_release);
 }
 
@@ -653,6 +1162,7 @@ inline bool enabled() {
 }
 
 inline void emit_begin(const char* name, const char* cat=nullptr) {
+  otrace::TracerGuard _tg;
   if (!should_emit(name, cat)) return;     
   if (!enabled()) return;
   Event* ev = get_tbuf()->append();
@@ -661,6 +1171,7 @@ inline void emit_begin(const char* name, const char* cat=nullptr) {
 }
 
 inline void emit_end(const char* name, const char* cat=nullptr) {
+  otrace::TracerGuard _tg;  
   if (!should_emit(name, cat)) return;     
   if (!enabled()) return;
   Event* ev = get_tbuf()->append();
@@ -669,6 +1180,7 @@ inline void emit_end(const char* name, const char* cat=nullptr) {
 }
 
 inline void emit_instant(const char* name, const char* cat=nullptr) {
+  otrace::TracerGuard _tg;
   if (!should_emit(name, cat)) return;     
   if (!enabled()) return;
   Event* ev = get_tbuf()->append();
@@ -676,7 +1188,20 @@ inline void emit_instant(const char* name, const char* cat=nullptr) {
   commit(ev);
 }
 
+inline void emit_instant_kvs(const char* name, const char* cat,
+                             const char* key, const char* value) {
+  otrace::TracerGuard _tg;
+  if (!should_emit(name, cat)) return;
+  if (!enabled()) return;
+  Event* ev = get_tbuf()->append();
+  fill_common(*ev, Phase::I, name, cat);
+  arg_string(*ev, key, value);
+  commit(ev);
+}
+
+
 inline void emit_instant_kv(const char* name, const char* key, double val, const char* cat=nullptr) {
+  otrace::TracerGuard _tg;
   if (!should_emit(name, cat)) return;     
   if (!enabled()) return;
   Event* ev = get_tbuf()->append();
@@ -686,6 +1211,7 @@ inline void emit_instant_kv(const char* name, const char* key, double val, const
 }
 
 inline void emit_counter_n(const char* name, const char* cat, int n, const char** keys, const double* vals) {
+  otrace::TracerGuard _tg;
   if (!should_emit(name, cat)) return;     
   if (!enabled()) return;
   Event* ev = get_tbuf()->append();
@@ -697,6 +1223,7 @@ inline void emit_counter_n(const char* name, const char* cat, int n, const char*
 }
 
 inline void emit_complete(const char* name, uint64_t dur_us, const char* cat=nullptr) {
+  otrace::TracerGuard _tg;
   if (!should_emit(name, cat)) return;
   if (!enabled()) return;
   Event* ev = get_tbuf()->append();
@@ -706,6 +1233,7 @@ inline void emit_complete(const char* name, uint64_t dur_us, const char* cat=nul
 }
 
 inline void emit_complete_kv(const char* name, uint64_t dur_us, const char* key, double val, const char* cat=nullptr) {
+  otrace::TracerGuard _tg;
   if (!should_emit(name, cat)) return;
   if (!enabled()) return;
   Event* ev = get_tbuf()->append();
@@ -717,6 +1245,7 @@ inline void emit_complete_kv(const char* name, uint64_t dur_us, const char* key,
 
 // ---- Variadic KV helpers for instants (numbers and strings) ----
 // String-like overloads first
+    
 inline void otrace_add_one_kv(Event& e, const char* key, const char* v) {
   arg_string(e, key, v ? v : "");
 }
@@ -793,6 +1322,7 @@ inline void set_next_color(const char* cname) {
 }
     
 inline void emit_flow(Phase ph, uint64_t id, const char* name=nullptr, const char* cat=nullptr) {
+  otrace::TracerGuard _tg;
   if (!name) name = "flow";
   if (!cat)  cat  = "flow";
   if (!should_emit(name, cat)) return;
@@ -816,17 +1346,20 @@ struct Scope {
 
   Scope(const char* nm, const char* ct=nullptr)
   : name(nm), cat(ct), arg_key(nullptr), arg_val(0), has_arg(false) {
+    otrace::TracerGuard _tg;  
     record = should_emit(name, cat);
     t0 = record ? now_us() : 0;
   }
 
   Scope(const char* nm, const char* ct, const char* key, double val)
   : name(nm), cat(ct), arg_key(key), arg_val(val), has_arg(true) {
+    otrace::TracerGuard _tg;  
     record = should_emit(name, cat);
     t0 = record ? now_us() : 0;
   }
 
   ~Scope() {
+    otrace::TracerGuard _tg;  
     if (!record) return;
     uint64_t dur = now_us() - t0;
     if (has_arg) emit_complete_kv(name, dur, arg_key, arg_val, cat);
@@ -1135,6 +1668,8 @@ inline void set_output_pattern(const char* pattern, uint32_t max_size_mb, uint32
   R.rot_index = 0;
 }
 
+
+
 // The big “do-it-all” rotated writer. Writes one fresh file per flush:
 // - Builds final path from pattern + rot_index (optionally appending "-%06u")
 // - Writes JSON to a .tmp
@@ -1158,7 +1693,7 @@ inline void write_rotated_trace(const std::vector<CleanEvent>& all) {
   }
 
   make_tmp_path(tmp_path, sizeof(tmp_path), adjusted_final);
-
+  otrace::mkpath(adjusted_final);                 
   // 1) Write plain JSON into tmp file
   FILE* ftmp = std::fopen(tmp_path, "wb");
   if (!ftmp) return;
@@ -1218,6 +1753,16 @@ inline void flush_file(const char* path) {
 
   std::vector<CleanEvent> all; all.reserve(4096);
   collect_all(all);
+    #if OTRACE_HEAP
+  // Generate heap report before flushing
+        #if 0  // <- disable to avoid deadlock
+  heap::generate_report();
+  // Re-collect to include heap report events
+  all.clear();
+  collect_all(all);
+  #endif
+    #endif
+
 
     // Sort for coherent timeline (ts, tid, seq if present)
   std::sort(all.begin(), all.end(), [](const CleanEvent& a, const CleanEvent& b){
@@ -1258,11 +1803,16 @@ inline void flush_file(const char* path) {
 
   // Legacy single-file path
   const char* out_path = path ? path : reg().default_path;
+  otrace::mkpath(out_path); 
   FILE* f = std::fopen(out_path, "wb");
   if (!f) { reg().enabled.store(prev, std::memory_order_release); return; }
 
   write_trace_json_FILE(f, all);
   std::fclose(f);
+  #if OTRACE_HEAP
+  // Generate heap report before flushing
+  heap::generate_report();
+  #endif
 
   reg().enabled.store(prev, std::memory_order_release);
 }    
@@ -1336,8 +1886,58 @@ inline void otrace_set_sampling(double keep) {
   if (keep < 0) keep = 0; if (keep > 1) keep = 1;
   reg().sample_keep = keep;
 }
+    
 
 } // namespace otrace
+
+#if OTRACE_HEAP && OTRACE_DEFINE_HEAP_HOOKS
+
+// Global new/delete operators
+void* operator new(std::size_t size) {
+    void* ptr = std::malloc(size);
+    if (ptr) otrace::heap::record_alloc(ptr, size);
+    return ptr;
+}
+
+void operator delete(void* ptr) noexcept {
+    otrace::heap::record_free(ptr);
+    std::free(ptr);
+}
+
+void* operator new[](std::size_t size) {
+    void* ptr = std::malloc(size);
+    if (ptr) otrace::heap::record_alloc(ptr, size);
+    return ptr;
+}
+
+void operator delete[](void* ptr) noexcept {
+    otrace::heap::record_free(ptr);
+    std::free(ptr);
+}
+
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+    void* ptr = std::malloc(size);
+    if (ptr) otrace::heap::record_alloc(ptr, size);
+    return ptr;
+}
+
+void operator delete(void* ptr, const std::nothrow_t&) noexcept {
+    otrace::heap::record_free(ptr);
+    std::free(ptr);
+}
+
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+    void* ptr = std::malloc(size);
+    if (ptr) otrace::heap::record_alloc(ptr, size);
+    return ptr;
+}
+
+void operator delete[](void* ptr, const std::nothrow_t&) noexcept {
+    otrace::heap::record_free(ptr);
+    std::free(ptr);
+}
+
+#endif // OTRACE_HEAP && OTRACE_DEFINE_HEAP_HOOKS
 
 // ---- Public API macros ----------------------------------------------------
 
@@ -1352,6 +1952,11 @@ inline void otrace_set_sampling(double keep) {
 
 // Colors
 #define OTRACE_COLOR(cname)      do{ OTRACE_TOUCH(); otrace::set_next_color((cname)); }while(0)
+
+#ifndef OTRACE_PP_CAT
+#define OTRACE_PP_CAT(a,b) OTRACE_PP_CAT_I(a,b)
+#define OTRACE_PP_CAT_I(a,b) a##b
+#endif
 
 // RAII scopes
 #define OTRACE_SCOPE(name) \
@@ -1369,13 +1974,6 @@ inline void otrace_set_sampling(double keep) {
 #define OTRACE_SCOPE_CKV(name, cat, key, val) \
   ::otrace::Scope OTRACE_PP_CAT(_otrace_scope_, __LINE__)( \
     ([&](){ (void)::otrace::hook(); return (name); }()), (cat), (key), (double)(val) )
-
-
-#ifndef OTRACE_PP_CAT
-#define OTRACE_PP_CAT(a,b) OTRACE_PP_CAT_I(a,b)
-#define OTRACE_PP_CAT_I(a,b) a##b
-#endif
-
 
 
 #define OTRACE_ZONE(name)            OTRACE_SCOPE_C((name), "zone")
@@ -1436,6 +2034,17 @@ inline void otrace_set_sampling(double keep) {
 #define OTRACE_ENABLE_CATS(csv)      do{ OTRACE_TOUCH(); ::otrace::otrace_enable_cats((csv)); }while(0)
 #define OTRACE_DISABLE_CATS(csv)     do{ OTRACE_TOUCH(); ::otrace::otrace_disable_cats((csv)); }while(0)
 #define OTRACE_SET_SAMPLING(p)       do{ OTRACE_TOUCH(); ::otrace::otrace_set_sampling((p)); }while(0)
+
+#if OTRACE_HEAP
+#define OTRACE_HEAP_ENABLE(on)        do{ OTRACE_TOUCH(); ::otrace::heap::enable(!!(on)); }while(0)
+#define OTRACE_HEAP_SET_SAMPLING(p)   do{ OTRACE_TOUCH(); ::otrace::heap::set_sampling((p)); }while(0)
+#define OTRACE_HEAP_REPORT()          do{ OTRACE_TOUCH(); ::otrace::heap::generate_report(); }while(0)
+#else
+#define OTRACE_HEAP_ENABLE(on)        ((void)0)
+#define OTRACE_HEAP_SET_SAMPLING(p)   ((void)0)
+#define OTRACE_HEAP_REPORT()          ((void)0)
+#endif
+
 
 
 
