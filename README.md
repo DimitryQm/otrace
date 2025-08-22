@@ -236,7 +236,7 @@ TRACE_COUNTER("queue_len", static_cast<int>(queue.size()));
 
 The orange arrows below connect a `make_job` slice on the producer to the corresponding `process` slice on the consumer. Use `TRACE_FLOW_BEGIN(id)` at the source, `TRACE_FLOW_STEP(id)` for hops, and `TRACE_FLOW_END(id)` at the sink. Pick a stable `id` (e.g., your job id).
 
-<p align="center"> <img src="docs/images/heap-tracingSQLQuery.png" alt="Perfetto “Query (SQL)” tab showing rows for heap_report_stats, heap_leaks, heap_sites" title="Perfetto Query(SQL)"> </p>
+<p align="center"> <img src="docs/images/flows.png" alt="Flow arrows connecting producer and consumer slices" title="Flows across threads"> </p>
 Arrows link a job’s creation on producer to its handling on consumer; breaks in arrows indicate queueing latency.
 
 **Minimal Repro**:
