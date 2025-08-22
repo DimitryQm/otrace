@@ -8,7 +8,7 @@ Build with the recorder and the heap tracer on. Define the global `new/delete` h
 ```cpp
 # recorder + heap tracer (+ readable symbols on Linux)
 c++ -std=c++17 -O2 -g -pthread -rdynamic \
-  -DOTRACE=1 -DOTRACE_HEAP=1 -DOTRACE_DEFINE_HEAP_HOOKS=1 \
+  -DOTRACE=1 -DOTRACE_HEAP=1 -DOTRACE_HEAP_STACKS=1 -DOTRACE_DEFINE_HEAP_HOOKS=1 \
   main.cpp -o heap_demo
 ```
 The hooks only attach in the TU that defines `OTRACE_DEFINE_HEAP_HOOKS`. Do not define it anywhere else. If your process already overrides global `new/delete`, skip this flag; the heap tracer still works for manual counters and the end-of-run report using allocations visible through the hooked operators.
