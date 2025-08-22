@@ -1,3 +1,5 @@
+// Build: c++ -std=c++17 -O2 -g -pthread -rdynamic -DOTRACE=1 -DOTRACE_HEAP=1 -DOTRACE_HEAP_STACKS=1 -DOTRACE_DEFINE_HEAP_HOOKS=1 examples/heap_demo.cpp -o heap_demo
+
 #include "otrace.hpp"
 #include <vector>
 #include <thread>
